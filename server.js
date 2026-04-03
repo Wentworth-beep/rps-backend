@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
+const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
@@ -8,6 +9,24 @@ require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
+
+// Neon Database Connection
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL || 'postgresql://neondb_owner:npg_f1H2zKZLaMTG@ep-winter-night-anhzdv3n-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require',
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 10000
+});
+
+// Test database connection
+pool.connect((err, client, release) => {
+    if (err) {
+        console.error('❌ Database connection error:', err.message);
+        process.exit(1);
+    } else {
+        console.log('✅ Connected to Neon Database');
+        release();
+    }
+});
 
 // CORS for Vercel
 const io = socketIo(server, {
@@ -25,64 +44,14 @@ app.use(cors({
 }));
 app.use(express.json());
 
-const JWT_SECRET = 'kirinyaga_secret_key_2025';
+const JWT_SECRET = process.env.JWT_SECRET || 'kirinyaga_secret_key_2025';
 
-// ============ DATABASE TABLES ============
-const users = [];
-let nextUserId = 1;
-
-// Friendships
-const friendships = [];
-let nextFriendshipId = 1;
-
-// Friend Requests
-const friendRequests = [];
-let nextFriendRequestId = 1;
-
-// Game Sessions
-const gameSessions = [];
-let nextGameSessionId = 1;
-
-// Matches
-const matches = [];
-let nextMatchId = 1;
-
-// Replays
-const replays = [];
-let nextReplayId = 1;
-
-// Tournaments
-const tournaments = [];
-let nextTournamentId = 1;
-
-// Tournament Participants
-const tournamentParticipants = [];
-
-// Power-ups
-const userPowerups = [];
-let nextPowerupId = 1;
-
-// Daily Rewards Log
-const dailyRewards = [];
-let nextDailyRewardId = 1;
-
-// Available Power-ups
-const availablePowerups = [
-    { id: 'double_points', name: 'Double Points', description: 'Win gives 2x coins', icon: 'fa-bolt', cost: 500, duration: 3 },
-    { id: 'shield', name: 'Shield', description: 'Loss doesn\'t reduce streak', icon: 'fa-shield-alt', cost: 300, duration: 1 },
-    { id: 'prediction', name: 'Prediction', description: 'See opponent\'s move', icon: 'fa-eye', cost: 400, duration: 1 },
-    { id: 'lucky_charm', name: 'Lucky Charm', description: 'Higher win chance', icon: 'fa-clover', cost: 600, duration: 5 },
-    { id: 'coin_boost', name: 'Coin Boost', description: 'Earn 2x coins for 5 matches', icon: 'fa-coins', cost: 800, duration: 5 }
-];
-
-// Active Matches for Multiplayer
-const activeMatches = [];
+// Active match sessions (10-round matches)
+const activeSessions = new Map();
 const matchmakingQueue = [];
-
-// Online Users
 let onlineUsers = [];
 
-// Level requirements (wins needed for each level)
+// Level requirements
 const levelRequirements = {
     1: 0, 2: 5, 3: 10, 4: 15, 5: 20, 6: 26, 7: 32, 8: 38, 9: 44, 10: 50,
     11: 57, 12: 64, 13: 71, 14: 78, 15: 85, 16: 93, 17: 101, 18: 109, 19: 117, 20: 125,
@@ -91,25 +60,10 @@ const levelRequirements = {
     41: 348, 42: 361, 43: 374, 44: 387, 45: 400, 46: 414, 47: 428, 48: 442, 49: 456, 50: 470
 };
 
-// Coin rewards for wins
-const winRewards = {
-    win: 50,
-    streak_bonus: 20,
-    perfect_win: 100,
-    comeback: 75
-};
-
-// Daily login rewards
-const dailyRewardAmounts = {
-    1: 100, 2: 150, 3: 200, 4: 250, 5: 300, 6: 400, 7: 500
-};
-
-// ============ HELPER FUNCTIONS ============
+// Helper functions
 function getLevelFromWins(wins) {
     for (let level = 50; level >= 1; level--) {
-        if (wins >= levelRequirements[level]) {
-            return level;
-        }
+        if (wins >= levelRequirements[level]) return level;
     }
     return 1;
 }
@@ -123,221 +77,6 @@ function getWinsNeededForNextLevel(currentWins) {
     return 0;
 }
 
-function getLevelUpReward(level) {
-    return level * 50; // 50 coins per level
-}
-
-function calculateCoinReward(won, streak, isPerfect = false, isComeback = false) {
-    if (!won) return 10; // Participation coins even on loss
-    
-    let reward = winRewards.win;
-    if (streak >= 3) reward += winRewards.streak_bonus;
-    if (streak >= 5) reward += winRewards.streak_bonus * 2;
-    if (streak >= 10) reward += winRewards.streak_bonus * 3;
-    if (isPerfect) reward += winRewards.perfect_win;
-    if (isComeback) reward += winRewards.comeback;
-    
-    return reward;
-}
-
-function findUserById(id) {
-    return users.find(u => u.id === id);
-}
-
-function findUserByUsername(username) {
-    return users.find(u => u.username === username);
-}
-
-function updateUserStats(userId, won, isPerfect = false, isComeback = false) {
-    const user = findUserById(userId);
-    if (!user) return;
-    
-    const previousLevel = getLevelFromWins(user.total_wins);
-    
-    if (won) {
-        user.total_wins++;
-        // Calculate coin reward
-        const reward = calculateCoinReward(true, user.win_streak, isPerfect, isComeback);
-        user.coins += reward;
-        user.win_streak++;
-        user.total_earned_coins += reward;
-        
-        // Update MMR
-        user.mmr += 25;
-    } else {
-        user.total_games++;
-        user.coins += 10; // Participation coins
-        user.win_streak = 0;
-        user.mmr = Math.max(0, user.mmr - 25);
-    }
-    
-    user.total_games++;
-    
-    // Update level
-    const newLevel = getLevelFromWins(user.total_wins);
-    if (newLevel > previousLevel) {
-        const levelUpReward = getLevelUpReward(newLevel);
-        user.coins += levelUpReward;
-        user.level = newLevel;
-        user.level_up_message = `Congratulations! You reached Level ${newLevel} and earned ${levelUpReward} coins!`;
-    } else {
-        user.level = newLevel;
-    }
-    
-    // Update rank based on MMR
-    if (user.mmr >= 3000) user.rank = 'Legend';
-    else if (user.mmr >= 2500) user.rank = 'Master';
-    else if (user.mmr >= 2000) user.rank = 'Diamond';
-    else if (user.mmr >= 1500) user.rank = 'Platinum';
-    else if (user.mmr >= 1000) user.rank = 'Gold';
-    else if (user.mmr >= 500) user.rank = 'Silver';
-    else user.rank = 'Bronze';
-    
-    // Update badge
-    if (user.total_wins >= 500) user.badge = 'Legend';
-    else if (user.total_wins >= 250) user.badge = 'Master';
-    else if (user.total_wins >= 100) user.badge = 'Diamond';
-    else if (user.total_wins >= 50) user.badge = 'Platinum';
-    else if (user.total_wins >= 25) user.badge = 'Gold';
-    else if (user.total_wins >= 10) user.badge = 'Silver';
-    else user.badge = 'Bronze';
-    
-    return {
-        coins_earned: won ? calculateCoinReward(true, user.win_streak - 1, isPerfect, isComeback) : 10,
-        new_level: newLevel > previousLevel,
-        level_up_reward: newLevel > previousLevel ? getLevelUpReward(newLevel) : 0,
-        wins_needed_next: getWinsNeededForNextLevel(user.total_wins)
-    };
-}
-
-function addMatch(player1Id, player2Id, winnerId, player1Move, player2Move, gameType, mmrChange, coinsEarned = 0) {
-    const match = {
-        id: nextMatchId++,
-        player1_id: player1Id,
-        player2_id: player2Id,
-        winner_id: winnerId,
-        player1_move: player1Move,
-        player2_move: player2Move,
-        game_type: gameType,
-        mmr_change: mmrChange,
-        coins_earned: coinsEarned,
-        created_at: new Date().toISOString()
-    };
-    matches.push(match);
-    
-    // Create replay
-    replays.push({
-        id: nextReplayId++,
-        match_id: match.id,
-        moves: JSON.stringify([{ player1: player1Move, player2: player2Move, winner: winnerId }]),
-        created_at: new Date().toISOString()
-    });
-    
-    return match;
-}
-
-// ============ DAILY REWARDS ============
-function claimDailyReward(userId) {
-    const user = findUserById(userId);
-    if (!user) return { success: false, error: 'User not found' };
-    
-    const today = new Date().toDateString();
-    const lastClaim = user.last_daily_claim ? new Date(user.last_daily_claim).toDateString() : null;
-    
-    if (lastClaim === today) {
-        return { success: false, error: 'Already claimed today' };
-    }
-    
-    let streak = user.daily_streak || 0;
-    if (lastClaim === new Date(Date.now() - 86400000).toDateString()) {
-        streak++;
-    } else {
-        streak = 1;
-    }
-    
-    if (streak > 7) streak = 7;
-    
-    const reward = dailyRewardAmounts[streak] || 100;
-    user.coins += reward;
-    user.daily_streak = streak;
-    user.last_daily_claim = new Date().toISOString();
-    
-    dailyRewards.push({
-        id: nextDailyRewardId++,
-        user_id: userId,
-        reward: reward,
-        streak: streak,
-        claimed_at: new Date().toISOString()
-    });
-    
-    return { success: true, reward: reward, streak: streak, total_coins: user.coins };
-}
-
-// ============ INITIALIZE DATA ============
-async function initData() {
-    // Create admin user
-    const adminHash = await bcrypt.hash('Peaceking', 10);
-    users.push({
-        id: nextUserId++,
-        username: 'admin',
-        email: 'santasantol087@gmail.com',
-        password_hash: adminHash,
-        role: 'admin',
-        badge: 'Legend',
-        level: 50,
-        total_wins: 5000,
-        total_games: 5500,
-        mmr: 3500,
-        rank: 'Legend',
-        is_banned: false,
-        avatar: 'dragon',
-        coins: 100000,
-        win_streak: 0,
-        daily_streak: 0,
-        total_earned_coins: 100000,
-        last_daily_claim: null,
-        created_at: new Date().toISOString()
-    });
-    
-    // Create sample users
-    const playerHash = await bcrypt.hash('player123', 10);
-    const sampleUsers = [
-        { username: 'CyberWarrior', email: 'warrior@test.com', badge: 'Master', level: 25, wins: 150, mmr: 2200, rank: 'Master', avatar: 'ninja', coins: 2500 },
-        { username: 'NeonRookie', email: 'rookie@test.com', badge: 'Bronze', level: 3, wins: 8, mmr: 450, rank: 'Bronze', avatar: 'robot', coins: 200 },
-        { username: 'GlitchMaster', email: 'glitch@test.com', badge: 'Gold', level: 12, wins: 60, mmr: 1200, rank: 'Gold', avatar: 'wizard', coins: 800 },
-        { username: 'ShadowBlade', email: 'shadow@test.com', badge: 'Platinum', level: 18, wins: 90, mmr: 1800, rank: 'Platinum', avatar: 'ghost', coins: 1500 }
-    ];
-    
-    for (const user of sampleUsers) {
-        users.push({
-            id: nextUserId++,
-            username: user.username,
-            email: user.email,
-            password_hash: playerHash,
-            role: 'user',
-            badge: user.badge,
-            level: user.level,
-            total_wins: user.wins,
-            total_games: user.wins + 50,
-            mmr: user.mmr,
-            rank: user.rank,
-            is_banned: false,
-            avatar: user.avatar,
-            coins: user.coins,
-            win_streak: 0,
-            daily_streak: 0,
-            total_earned_coins: user.coins,
-            last_daily_claim: null,
-            created_at: new Date().toISOString()
-        });
-    }
-    
-    console.log('✅ Database initialized with', users.length, 'users');
-    console.log('   Level requirements configured for levels 1-50');
-    console.log('   Coin rewards: Win=' + winRewards.win + ', Streak bonus=' + winRewards.streak_bonus);
-    console.log('   Daily rewards: Day 1-7 = 100-500 coins');
-}
-
 // ============ USER ROUTES ============
 
 // Register
@@ -348,78 +87,80 @@ app.post('/api/register', async (req, res) => {
         return res.status(400).json({ error: 'All fields required' });
     }
     
-    const existing = findUserByUsername(username);
-    if (existing) {
-        return res.status(400).json({ error: 'Username already exists' });
+    try {
+        const existing = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+        if (existing.rows.length > 0) {
+            return res.status(400).json({ error: 'Username already exists' });
+        }
+        
+        const passwordHash = await bcrypt.hash(password, 10);
+        const result = await pool.query(
+            `INSERT INTO users (username, email, password_hash, role, badge, level, coins, avatar)
+             VALUES ($1, $2, $3, 'user', 'Bronze', 1, 500, 'ninja')
+             RETURNING id, username, role, badge, level, coins, avatar`,
+            [username, email, passwordHash]
+        );
+        
+        const token = jwt.sign({ id: result.rows[0].id, username, role: 'user' }, JWT_SECRET);
+        res.json({ success: true, token, user: result.rows[0] });
+    } catch (error) {
+        console.error('Register error:', error);
+        res.status(500).json({ error: 'Registration failed' });
     }
-    
-    const hash = await bcrypt.hash(password, 10);
-    const newUser = {
-        id: nextUserId++,
-        username,
-        email,
-        password_hash: hash,
-        role: 'user',
-        badge: 'Bronze',
-        level: 1,
-        total_wins: 0,
-        total_games: 0,
-        mmr: 500,
-        rank: 'Bronze',
-        is_banned: false,
-        avatar: 'ninja',
-        coins: 500, // Starting coins
-        win_streak: 0,
-        daily_streak: 0,
-        total_earned_coins: 500,
-        last_daily_claim: null,
-        created_at: new Date().toISOString()
-    };
-    users.push(newUser);
-    
-    const token = jwt.sign({ id: newUser.id, username: newUser.username, role: newUser.role }, JWT_SECRET);
-    res.json({ success: true, token, user: newUser });
 });
 
 // Login
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     
-    const user = findUserByUsername(username);
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-    if (user.is_banned) return res.status(403).json({ error: 'Account banned' });
-    
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-    
-    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET);
-    res.json({
-        success: true,
-        token,
-        user: {
-            id: user.id, username: user.username, role: user.role,
-            badge: user.badge, level: user.level, total_wins: user.total_wins,
-            mmr: user.mmr, rank: user.rank, coins: user.coins, avatar: user.avatar,
-            win_streak: user.win_streak, daily_streak: user.daily_streak || 0,
-            wins_needed_next: getWinsNeededForNextLevel(user.total_wins)
+    try {
+        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        if (result.rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
-    });
+        
+        const user = result.rows[0];
+        if (user.is_banned) return res.status(403).json({ error: 'Account banned' });
+        
+        const valid = await bcrypt.compare(password, user.password_hash);
+        if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+        
+        const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET);
+        res.json({
+            success: true,
+            token,
+            user: {
+                id: user.id, username: user.username, role: user.role,
+                badge: user.badge, level: user.level, total_wins: user.total_wins,
+                mmr: user.mmr, rank: user.rank, coins: user.coins, avatar: user.avatar,
+                win_streak: user.win_streak, daily_streak: user.daily_streak || 0,
+                wins_needed_next: getWinsNeededForNextLevel(user.total_wins)
+            }
+        });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ error: 'Login failed' });
+    }
 });
 
-// Get user stats (includes level progression)
-app.get('/api/user/stats', (req, res) => {
+// Get user stats
+app.get('/api/user/stats', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
     
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        const user = findUserById(decoded.id);
+        const result = await pool.query(
+            `SELECT username, badge, level, total_wins, total_games, mmr, rank, coins, avatar, win_streak, daily_streak, total_earned_coins
+             FROM users WHERE id = $1`,
+            [decoded.id]
+        );
+        
+        if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+        
+        const user = result.rows[0];
         res.json({
-            username: user.username, badge: user.badge, level: user.level,
-            total_wins: user.total_wins, total_games: user.total_games,
-            mmr: user.mmr, rank: user.rank, coins: user.coins, avatar: user.avatar,
-            win_streak: user.win_streak, daily_streak: user.daily_streak || 0,
-            total_earned_coins: user.total_earned_coins,
+            ...user,
             wins_needed_next: getWinsNeededForNextLevel(user.total_wins),
             next_level_wins: levelRequirements[user.level + 1] || levelRequirements[50],
             current_level_wins: levelRequirements[user.level] || 0
@@ -429,22 +170,8 @@ app.get('/api/user/stats', (req, res) => {
     }
 });
 
-// Claim daily reward
-app.post('/api/daily-reward', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const result = claimDailyReward(decoded.id);
-        res.json(result);
-    } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
-    }
-});
-
-// Play vs Computer (with coin rewards and level tracking)
-app.post('/api/game/computer', (req, res) => {
+// Play vs Computer
+app.post('/api/game/computer', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
     
@@ -487,394 +214,398 @@ app.post('/api/game/computer', (req, res) => {
             result = 'lose';
         }
         
-        // Update user stats with rewards
-        const statsUpdate = updateUserStats(decoded.id, won, false, false);
-        const updatedUser = findUserById(decoded.id);
+        // Get current user data
+        const userResult = await pool.query('SELECT total_wins, win_streak, coins, level FROM users WHERE id = $1', [decoded.id]);
+        const user = userResult.rows[0];
         
-        res.json({ 
-            result, 
-            computerMove, 
+        let coinsEarned = 10;
+        let newWinStreak = user.win_streak;
+        let newTotalWins = user.total_wins;
+        let levelUp = false;
+        let levelUpReward = 0;
+        
+        if (won) {
+            coinsEarned = 50;
+            if (user.win_streak >= 2) coinsEarned += 20;
+            if (user.win_streak >= 4) coinsEarned += 40;
+            newWinStreak = user.win_streak + 1;
+            newTotalWins = user.total_wins + 1;
+            
+            // Check level up
+            const oldLevel = getLevelFromWins(user.total_wins);
+            const newLevel = getLevelFromWins(newTotalWins);
+            if (newLevel > oldLevel) {
+                levelUp = true;
+                levelUpReward = newLevel * 50;
+            }
+            
+            await pool.query(
+                `UPDATE users SET total_wins = total_wins + 1, total_games = total_games + 1, 
+                 coins = coins + $1, win_streak = $2, mmr = mmr + 25, level = $3
+                 WHERE id = $4`,
+                [coinsEarned, newWinStreak, newLevel, decoded.id]
+            );
+        } else if (result === 'lose') {
+            newWinStreak = 0;
+            await pool.query(
+                `UPDATE users SET total_games = total_games + 1, coins = coins + $1, 
+                 win_streak = $2, mmr = GREATEST(mmr - 25, 0)
+                 WHERE id = $3`,
+                [10, 0, decoded.id]
+            );
+        } else {
+            await pool.query(
+                `UPDATE users SET total_games = total_games + 1, coins = coins + $1
+                 WHERE id = $2`,
+                [10, decoded.id]
+            );
+        }
+        
+        // Save match to database
+        await pool.query(
+            `INSERT INTO matches (player1_id, player2_id, winner_id, player1_move, player2_move, game_type, mmr_change, coins_earned)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [decoded.id, null, won ? decoded.id : null, playerMove, computerMove, 'computer', won ? 25 : -25, coinsEarned]
+        );
+        
+        const updatedUser = await pool.query('SELECT coins, level, total_wins FROM users WHERE id = $1', [decoded.id]);
+        
+        res.json({
+            result,
+            computerMove,
             playerMove,
-            coins_earned: statsUpdate?.coins_earned || (won ? 50 : 10),
-            level_up: statsUpdate?.new_level || false,
-            level_up_reward: statsUpdate?.level_up_reward || 0,
-            new_level: updatedUser?.level,
-            wins_needed_next: getWinsNeededForNextLevel(updatedUser?.total_wins || 0),
-            total_coins: updatedUser?.coins,
-            win_streak: updatedUser?.win_streak
+            coins_earned: coinsEarned,
+            level_up: levelUp,
+            level_up_reward: levelUpReward,
+            new_level: getLevelFromWins(newTotalWins),
+            wins_needed_next: getWinsNeededForNextLevel(newTotalWins),
+            total_coins: updatedUser.rows[0].coins,
+            win_streak: newWinStreak,
+            winner: won ? 'You' : (result === 'lose' ? 'Computer' : 'Tie'),
+            loser: won ? 'Computer' : (result === 'lose' ? 'You' : 'None')
         });
     } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
+        console.error('Game error:', error);
+        res.status(500).json({ error: 'Game failed' });
     }
 });
 
-// Get level requirements
-app.get('/api/level-requirements', (req, res) => {
-    res.json(levelRequirements);
+// Get match history
+app.get('/api/match-history', async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Token required' });
+    
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const result = await pool.query(
+            `SELECT m.*, 
+             CASE WHEN m.winner_id = $1 THEN 'win' ELSE 'lose' END as result,
+             COALESCE(u.username, 'Computer') as opponent
+             FROM matches m
+             LEFT JOIN users u ON (CASE WHEN m.player1_id = $1 THEN m.player2_id ELSE m.player1_id END) = u.id
+             WHERE m.player1_id = $1 OR m.player2_id = $1
+             ORDER BY m.created_at DESC LIMIT 20`,
+            [decoded.id]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        res.status(403).json({ error: 'Invalid token' });
+    }
 });
 
 // Leaderboard
-app.get('/api/leaderboard', (req, res) => {
-    const leaderboard = [...users]
-        .filter(u => u.role === 'user')
-        .sort((a, b) => b.mmr - a.mmr)
-        .slice(0, 20)
-        .map((u, i) => ({
-            rank: i + 1, username: u.username, wins: u.total_wins,
-            mmr: u.mmr, badge: u.badge, avatar: u.avatar, level: u.level,
-            coins: u.coins
-        }));
-    res.json(leaderboard);
-});
-
-// Match History
-app.get('/api/match-history', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const userMatches = matches.filter(m => m.player1_id === decoded.id || m.player2_id === decoded.id);
-        const history = userMatches.slice(0, 20).map(m => {
-            const isWinner = m.winner_id === decoded.id;
-            const opponentId = m.player1_id === decoded.id ? m.player2_id : m.player1_id;
-            const opponent = findUserById(opponentId);
-            return {
-                result: isWinner ? 'win' : (m.winner_id === null ? 'tie' : 'lose'),
-                opponent: opponent ? opponent.username : 'Computer',
-                mmrChange: m.mmr_change || 0,
-                coinsEarned: m.coins_earned || 0,
-                timestamp: m.created_at
-            };
-        });
-        res.json(history);
-    } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
-    }
+app.get('/api/leaderboard', async (req, res) => {
+    const result = await pool.query(
+        `SELECT id, username, total_wins as wins, mmr, badge, avatar, level, coins
+         FROM users WHERE role = 'user' 
+         ORDER BY mmr DESC LIMIT 20`
+    );
+    res.json(result.rows.map((u, i) => ({ ...u, rank: i + 1 })));
 });
 
 // Verify token
-app.get('/api/verify-token', (req, res) => {
+app.get('/api/verify-token', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        res.json({ valid: true, user: decoded });
+        const result = await pool.query('SELECT id, username, role FROM users WHERE id = $1', [decoded.id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+        res.json({ valid: true, user: result.rows[0] });
     } catch (error) {
         res.status(403).json({ error: 'Invalid token' });
     }
 });
 
-// ============ FRIEND SYSTEM ============
-app.post('/api/friends/request', (req, res) => {
+// Update avatar
+app.post('/api/update-avatar', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
     
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        const { username } = req.body;
-        const friend = findUserByUsername(username);
-        
-        if (!friend) return res.status(404).json({ error: 'User not found' });
-        if (friend.id === decoded.id) return res.status(400).json({ error: 'Cannot add yourself' });
-        
-        const existing = friendRequests.find(r => 
-            (r.from_id === decoded.id && r.to_id === friend.id) ||
-            (r.from_id === friend.id && r.to_id === decoded.id)
-        );
-        if (existing) return res.status(400).json({ error: 'Request already sent' });
-        
-        friendRequests.push({
-            id: nextFriendRequestId++,
-            from_id: decoded.id,
-            to_id: friend.id,
-            status: 'pending',
-            created_at: new Date().toISOString()
-        });
-        
-        res.json({ success: true, message: 'Friend request sent' });
-    } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
-    }
-});
-
-app.post('/api/friends/accept/:requestId', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const requestId = parseInt(req.params.requestId);
-        const request = friendRequests.find(r => r.id === requestId);
-        
-        if (!request) return res.status(404).json({ error: 'Request not found' });
-        if (request.to_id !== decoded.id) return res.status(403).json({ error: 'Not authorized' });
-        
-        request.status = 'accepted';
-        friendships.push({
-            id: nextFriendshipId++,
-            user_id1: request.from_id,
-            user_id2: request.to_id,
-            status: 'accepted',
-            created_at: new Date().toISOString()
-        });
-        
+        const { avatar } = req.body;
+        await pool.query('UPDATE users SET avatar = $1 WHERE id = $2', [avatar, decoded.id]);
         res.json({ success: true });
     } catch (error) {
         res.status(403).json({ error: 'Invalid token' });
     }
 });
 
-app.get('/api/friends/list', (req, res) => {
+// ============ 10-MATCH SESSION MULTIPLAYER ============
+
+// Create a 10-round match session
+app.post('/api/match/session/create', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
     
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        const userFriendships = friendships.filter(f => f.user_id1 === decoded.id || f.user_id2 === decoded.id);
-        const friends = userFriendships.map(f => {
-            const friendId = f.user_id1 === decoded.id ? f.user_id2 : f.user_id1;
-            return findUserById(friendId);
-        }).filter(f => f);
+        const sessionCode = Math.random().toString(36).substring(2, 10).toUpperCase();
         
-        res.json(friends.map(f => ({
-            id: f.id, username: f.username, avatar: f.avatar, rank: f.rank, 
-            online: onlineUsers.some(u => u.userId === f.id), level: f.level
-        })));
-    } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
-    }
-});
-
-app.get('/api/friends/requests', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const pending = friendRequests.filter(r => r.to_id === decoded.id && r.status === 'pending');
-        const requestsWithSender = pending.map(r => {
-            const sender = findUserById(r.from_id);
-            return { id: r.id, from_id: r.from_id, from_username: sender?.username, created_at: r.created_at };
-        });
-        res.json(requestsWithSender);
-    } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
-    }
-});
-
-// ============ POWER-UPS ============
-app.get('/api/powerups', (req, res) => {
-    res.json(availablePowerups);
-});
-
-app.post('/api/powerups/buy', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const { powerUpId } = req.body;
-        const powerUp = availablePowerups.find(p => p.id === powerUpId);
-        
-        if (!powerUp) return res.status(404).json({ error: 'Power-up not found' });
-        
-        const user = findUserById(decoded.id);
-        if (user.coins < powerUp.cost) return res.status(400).json({ error: 'Not enough coins' });
-        
-        user.coins -= powerUp.cost;
-        userPowerups.push({
-            id: nextPowerupId++,
-            user_id: decoded.id,
-            powerup_id: powerUpId,
-            quantity: 1,
-            acquired_at: new Date().toISOString()
-        });
-        
-        res.json({ success: true, coins: user.coins, message: `Bought ${powerUp.name}!` });
-    } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
-    }
-});
-
-app.get('/api/user/powerups', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const userPowerupList = userPowerups.filter(p => p.user_id === decoded.id);
-        const powerupsWithDetails = userPowerupList.map(p => {
-            const details = availablePowerups.find(ap => ap.id === p.powerup_id);
-            return { ...p, name: details?.name, icon: details?.icon };
-        });
-        res.json(powerupsWithDetails);
-    } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
-    }
-});
-
-// ============ TOURNAMENTS ============
-app.post('/api/tournament/create', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const { name, maxPlayers = 8, prizePool = 0 } = req.body;
-        
-        const tournament = {
-            id: nextTournamentId++,
-            name: name || `${findUserById(decoded.id).username}'s Tournament`,
-            host_id: decoded.id,
+        const session = {
+            code: sessionCode,
+            player1: { id: decoded.id, username: decoded.username },
+            player2: null,
+            rounds: [],
+            player1Wins: 0,
+            player2Wins: 0,
+            ties: 0,
+            currentRound: 1,
+            totalRounds: 10,
             status: 'waiting',
-            max_players: maxPlayers,
-            current_players: 1,
-            prize_pool: prizePool,
-            created_at: new Date().toISOString()
+            createdAt: Date.now()
         };
-        tournaments.push(tournament);
         
-        tournamentParticipants.push({
-            tournament_id: tournament.id,
-            user_id: decoded.id,
-            username: findUserById(decoded.id).username,
-            status: 'registered',
-            joined_at: new Date().toISOString()
-        });
-        
-        res.json({ success: true, tournamentId: tournament.id, code: tournament.id });
+        activeSessions.set(sessionCode, session);
+        res.json({ success: true, sessionCode, totalRounds: 10 });
     } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
+        res.status(500).json({ error: 'Failed to create session' });
     }
 });
 
-app.post('/api/tournament/join', (req, res) => {
+// Join a 10-round match session
+app.post('/api/match/session/join', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
     
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        const { tournamentId } = req.body;
-        const tournament = tournaments.find(t => t.id === parseInt(tournamentId));
+        const { sessionCode } = req.body;
+        const session = activeSessions.get(sessionCode);
         
-        if (!tournament) return res.status(404).json({ error: 'Tournament not found' });
-        if (tournament.status !== 'waiting') return res.status(400).json({ error: 'Tournament already started' });
-        if (tournament.current_players >= tournament.max_players) return res.status(400).json({ error: 'Tournament is full' });
+        if (!session) return res.status(404).json({ error: 'Session not found' });
+        if (session.player2) return res.status(400).json({ error: 'Session full' });
         
-        tournament.current_players++;
-        tournamentParticipants.push({
-            tournament_id: tournament.id,
-            user_id: decoded.id,
-            username: findUserById(decoded.id).username,
-            status: 'registered',
-            joined_at: new Date().toISOString()
-        });
+        session.player2 = { id: decoded.id, username: decoded.username };
+        session.status = 'active';
         
-        if (tournament.current_players === tournament.max_players) {
-            tournament.status = 'active';
-            const participants = tournamentParticipants.filter(p => p.tournament_id === tournament.id);
-            const shuffled = [...participants];
-            for (let i = shuffled.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-            }
-            tournament.bracket = shuffled;
+        // Save session to database
+        const dbResult = await pool.query(
+            `INSERT INTO match_sessions (player1_id, player2_id, total_rounds, started_at)
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+             RETURNING id`,
+            [session.player1.id, session.player2.id, 10]
+        );
+        session.dbId = dbResult.rows[0].id;
+        
+        res.json({ success: true, sessionCode, totalRounds: 10, opponent: session.player1.username });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to join session' });
+    }
+});
+
+// Make a move in a round
+app.post('/api/match/session/move', async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Token required' });
+    
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const { sessionCode, move, roundNumber } = req.body;
+        const session = activeSessions.get(sessionCode);
+        
+        if (!session) return res.status(404).json({ error: 'Session not found' });
+        if (session.status !== 'active') return res.status(400).json({ error: 'Session not active' });
+        
+        // Store the move
+        if (!session.rounds[roundNumber]) {
+            session.rounds[roundNumber] = {};
         }
         
-        res.json({ success: true });
+        if (session.player1.id === decoded.id) {
+            session.rounds[roundNumber].player1Move = move;
+        } else if (session.player2.id === decoded.id) {
+            session.rounds[roundNumber].player2Move = move;
+        } else {
+            return res.status(403).json({ error: 'Not a participant' });
+        }
+        
+        // Check if both players have made their moves
+        const round = session.rounds[roundNumber];
+        if (round.player1Move && round.player2Move) {
+            // Determine winner
+            const p1Move = round.player1Move;
+            const p2Move = round.player2Move;
+            let roundWinner = null;
+            let roundLoser = null;
+            
+            if (p1Move === p2Move) {
+                session.ties++;
+                roundWinner = 'tie';
+            } else if (
+                (p1Move === 'rock' && p2Move === 'scissors') ||
+                (p1Move === 'paper' && p2Move === 'rock') ||
+                (p1Move === 'scissors' && p2Move === 'paper')
+            ) {
+                session.player1Wins++;
+                roundWinner = session.player1.username;
+                roundLoser = session.player2.username;
+            } else {
+                session.player2Wins++;
+                roundWinner = session.player2.username;
+                roundLoser = session.player1.username;
+            }
+            
+            round.winner = roundWinner;
+            round.loser = roundLoser;
+            
+            // Check if session is complete
+            if (session.currentRound >= session.totalRounds) {
+                // Session complete - determine overall winner
+                let overallWinner = null;
+                let overallLoser = null;
+                let winnerId = null;
+                
+                if (session.player1Wins > session.player2Wins) {
+                    overallWinner = session.player1.username;
+                    overallLoser = session.player2.username;
+                    winnerId = session.player1.id;
+                } else if (session.player2Wins > session.player1Wins) {
+                    overallWinner = session.player2.username;
+                    overallLoser = session.player1.username;
+                    winnerId = session.player2.id;
+                } else {
+                    overallWinner = 'tie';
+                }
+                
+                session.status = 'completed';
+                
+                // Update database with session results
+                await pool.query(
+                    `UPDATE match_sessions 
+                     SET player1_wins = $1, player2_wins = $2, ties = $3, winner_id = $4, completed_at = CURRENT_TIMESTAMP
+                     WHERE id = $5`,
+                    [session.player1Wins, session.player2Wins, session.ties, winnerId, session.dbId]
+                );
+                
+                // Update user stats
+                if (winnerId) {
+                    await pool.query(
+                        `UPDATE users SET total_wins = total_wins + 1, total_games = total_games + 1, coins = coins + 100, mmr = mmr + 50
+                         WHERE id = $1`,
+                        [winnerId]
+                    );
+                    const loserId = winnerId === session.player1.id ? session.player2.id : session.player1.id;
+                    await pool.query(
+                        `UPDATE users SET total_games = total_games + 1, coins = coins + 50, mmr = GREATEST(mmr - 25, 0)
+                         WHERE id = $1`,
+                        [loserId]
+                    );
+                }
+                
+                res.json({
+                    type: 'session_complete',
+                    winner: overallWinner,
+                    loser: overallLoser,
+                    player1Wins: session.player1Wins,
+                    player2Wins: session.player2Wins,
+                    ties: session.ties,
+                    totalRounds: session.totalRounds,
+                    roundWinner,
+                    roundLoser
+                });
+                
+                // Clean up session
+                setTimeout(() => activeSessions.delete(sessionCode), 60000);
+            } else {
+                session.currentRound++;
+                res.json({
+                    type: 'round_complete',
+                    roundWinner,
+                    roundLoser,
+                    currentRound: session.currentRound,
+                    totalRounds: session.totalRounds,
+                    player1Wins: session.player1Wins,
+                    player2Wins: session.player2Wins,
+                    ties: session.ties,
+                    nextRound: session.currentRound
+                });
+            }
+        } else {
+            res.json({ type: 'move_received', message: 'Move recorded, waiting for opponent' });
+        }
     } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
+        console.error('Move error:', error);
+        res.status(500).json({ error: 'Failed to record move' });
     }
 });
 
-app.get('/api/tournament/:id', (req, res) => {
-    const tournament = tournaments.find(t => t.id === parseInt(req.params.id));
-    if (!tournament) return res.status(404).json({ error: 'Tournament not found' });
+// Get session status
+app.get('/api/match/session/:code', (req, res) => {
+    const session = activeSessions.get(req.params.code);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
     
-    const participants = tournamentParticipants.filter(p => p.tournament_id === tournament.id);
-    res.json({ ...tournament, participants });
-});
-
-app.get('/api/tournaments', (req, res) => {
-    const activeTournaments = tournaments.filter(t => t.status === 'waiting');
-    res.json(activeTournaments);
-});
-
-// ============ ACHIEVEMENTS ============
-app.get('/api/achievements', (req, res) => {
-    const achievements = [
-        { id: 'first_blood', name: 'First Blood', description: 'Win your first match', icon: 'fa-trophy', requirement: 1 },
-        { id: 'warrior', name: 'Warrior', description: 'Win 10 matches', icon: 'fa-shield-alt', requirement: 10 },
-        { id: 'legendary', name: 'Legendary', description: 'Win 50 matches', icon: 'fa-crown', requirement: 50 },
-        { id: 'veteran', name: 'Veteran', description: 'Play 100 matches', icon: 'fa-star', requirement: 100 },
-        { id: 'millionaire', name: 'Millionaire', description: 'Earn 1000 coins', icon: 'fa-coins', requirement: 1000 },
-        { id: 'streak_master', name: 'Streak Master', description: 'Win 5 in a row', icon: 'fa-fire', requirement: 5 }
-    ];
-    
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.json(achievements.map(a => ({ ...a, unlocked: false })));
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const user = findUserById(decoded.id);
-        
-        const unlockedAchievements = achievements.map(a => {
-            let unlocked = false;
-            if (a.id === 'first_blood' && user.total_wins >= 1) unlocked = true;
-            if (a.id === 'warrior' && user.total_wins >= 10) unlocked = true;
-            if (a.id === 'legendary' && user.total_wins >= 50) unlocked = true;
-            if (a.id === 'veteran' && user.total_games >= 100) unlocked = true;
-            if (a.id === 'millionaire' && user.total_earned_coins >= 1000) unlocked = true;
-            if (a.id === 'streak_master' && user.win_streak >= 5) unlocked = true;
-            return { ...a, unlocked };
-        });
-        
-        res.json(unlockedAchievements);
-    } catch (error) {
-        res.json(achievements.map(a => ({ ...a, unlocked: false })));
-    }
+    res.json({
+        code: session.code,
+        player1: session.player1,
+        player2: session.player2,
+        player1Wins: session.player1Wins,
+        player2Wins: session.player2Wins,
+        ties: session.ties,
+        currentRound: session.currentRound,
+        totalRounds: session.totalRounds,
+        status: session.status,
+        rounds: session.rounds
+    });
 });
 
 // ============ ADMIN ROUTES ============
 app.post('/api/admin/login', async (req, res) => {
     const { username, password } = req.body;
-    const user = findUserByUsername(username);
-    if (!user || user.role !== 'admin') return res.status(401).json({ error: 'Invalid admin credentials' });
-    const valid = await bcrypt.compare(password, user.password_hash);
+    const result = await pool.query('SELECT * FROM users WHERE username = $1 AND role = $2', [username, 'admin']);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid admin credentials' });
+    
+    const valid = await bcrypt.compare(password, result.rows[0].password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid admin credentials' });
-    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET);
-    res.json({ success: true, token, admin: { id: user.id, username: user.username, role: user.role } });
+    
+    const token = jwt.sign({ id: result.rows[0].id, username, role: 'admin' }, JWT_SECRET);
+    res.json({ success: true, token, admin: { id: result.rows[0].id, username } });
 });
 
-app.get('/api/admin/users', (req, res) => {
+app.get('/api/admin/users', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
         if (decoded.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-        const allUsers = users.map(u => ({
-            id: u.id, username: u.username, email: u.email, role: u.role,
-            badge: u.badge, level: u.level, total_wins: u.total_wins,
-            mmr: u.mmr, is_banned: u.is_banned, avatar: u.avatar, coins: u.coins
-        }));
-        res.json(allUsers);
+        
+        const result = await pool.query('SELECT id, username, email, role, badge, level, total_wins, mmr, is_banned, avatar, coins FROM users');
+        res.json(result.rows);
     } catch (error) {
         res.status(403).json({ error: 'Invalid token' });
     }
 });
 
-app.post('/api/admin/ban-user', (req, res) => {
+app.post('/api/admin/ban-user', async (req, res) => {
     const { userId, ban } = req.body;
-    const user = findUserById(parseInt(userId));
-    if (user && user.role !== 'admin') user.is_banned = ban;
+    await pool.query('UPDATE users SET is_banned = $1 WHERE id = $2 AND role != $3', [ban, userId, 'admin']);
     res.json({ success: true });
 });
 
-app.post('/api/admin/update-badge', (req, res) => {
+app.post('/api/admin/update-badge', async (req, res) => {
     const { userId, badge } = req.body;
-    const user = findUserById(parseInt(userId));
-    if (user) user.badge = badge;
+    await pool.query('UPDATE users SET badge = $1 WHERE id = $2', [badge, userId]);
     res.json({ success: true });
 });
 
@@ -882,34 +613,16 @@ app.get('/api/admin/online-count', (req, res) => {
     res.json({ count: onlineUsers.length });
 });
 
-app.get('/api/admin/total-users', (req, res) => {
-    const count = users.filter(u => u.role === 'user').length;
-    res.json({ count });
+app.get('/api/admin/total-users', async (req, res) => {
+    const result = await pool.query("SELECT COUNT(*) as count FROM users WHERE role = 'user'");
+    res.json({ count: parseInt(result.rows[0].count) });
 });
 
-// Update avatar
-app.post('/api/update-avatar', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const { avatar } = req.body;
-        const user = findUserById(decoded.id);
-        if (user) user.avatar = avatar;
-        res.json({ success: true });
-    } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
-    }
-});
-
-// ============ SOCKET.IO ============
+// ============ SOCKET.IO for real-time ============
 io.on('connection', (socket) => {
     console.log('Client connected:', socket.id);
-    let currentUserId = null;
     
     socket.on('user-online', (data) => {
-        currentUserId = data.userId;
         onlineUsers.push({ userId: data.userId, username: data.username, socketId: socket.id });
         io.emit('online-count', { count: onlineUsers.length });
     });
@@ -925,12 +638,24 @@ io.on('connection', (socket) => {
                 const player2 = matchmakingQueue.shift();
                 
                 if (player1 && player2) {
-                    const matchCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-                    const match = { matchCode, player1, player2, status: 'active' };
-                    activeMatches.push(match);
+                    const sessionCode = Math.random().toString(36).substring(2, 10).toUpperCase();
+                    const session = {
+                        code: sessionCode,
+                        player1: { id: player1.userId, username: player1.username },
+                        player2: { id: player2.userId, username: player2.username },
+                        rounds: [],
+                        player1Wins: 0,
+                        player2Wins: 0,
+                        ties: 0,
+                        currentRound: 1,
+                        totalRounds: 10,
+                        status: 'active',
+                        createdAt: Date.now()
+                    };
+                    activeSessions.set(sessionCode, session);
                     
-                    io.to(player1.socketId).emit('match-found', { matchCode, opponent: player2.username });
-                    io.to(player2.socketId).emit('match-found', { matchCode, opponent: player1.username });
+                    io.to(player1.socketId).emit('match-found', { sessionCode, opponent: player2.username, totalRounds: 10 });
+                    io.to(player2.socketId).emit('match-found', { sessionCode, opponent: player1.username, totalRounds: 10 });
                     clearInterval(checkMatch);
                 }
             }
@@ -941,70 +666,6 @@ io.on('connection', (socket) => {
             if (index !== -1) matchmakingQueue.splice(index, 1);
             clearInterval(checkMatch);
         });
-    });
-    
-    socket.on('create-match', (data) => {
-        const matchCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-        activeMatches.push({ matchCode, hostId: data.userId, hostName: data.username, hostSocket: socket.id, status: 'waiting' });
-        socket.join(matchCode);
-        socket.emit('match-created', { matchCode });
-    });
-    
-    socket.on('join-match', (data) => {
-        const match = activeMatches.find(m => m.matchCode === data.matchCode && m.status === 'waiting');
-        if (match) {
-            match.opponentId = data.userId;
-            match.opponentName = data.username;
-            match.opponentSocket = socket.id;
-            match.status = 'active';
-            
-            socket.join(data.matchCode);
-            io.to(match.hostSocket).emit('match-started', { matchCode: data.matchCode });
-            socket.emit('match-started', { matchCode: data.matchCode });
-        } else {
-            socket.emit('join-error', { error: 'Match not found' });
-        }
-    });
-    
-    socket.on('make-move', (data) => {
-        const match = activeMatches.find(m => m.matchCode === data.matchCode);
-        if (match) {
-            if (match.hostId === data.userId) match.hostMove = data.move;
-            else match.opponentMove = data.move;
-            
-            if (match.hostMove && match.opponentMove) {
-                let winner = null;
-                if (match.hostMove === match.opponentMove) winner = 'tie';
-                else if ((match.hostMove === 'rock' && match.opponentMove === 'scissors') ||
-                         (match.hostMove === 'paper' && match.opponentMove === 'rock') ||
-                         (match.hostMove === 'scissors' && match.opponentMove === 'paper')) {
-                    winner = match.hostId;
-                } else {
-                    winner = match.opponentId;
-                }
-                
-                if (winner !== 'tie') {
-                    const winnerUser = findUserById(winner);
-                    const loserId = winner === match.hostId ? match.opponentId : match.hostId;
-                    updateUserStats(winner, true);
-                    updateUserStats(loserId, false);
-                    addMatch(match.hostId, match.opponentId, winner, match.hostMove, match.opponentMove, 'casual', winner === match.hostId ? 25 : -25);
-                }
-                
-                io.to(data.matchCode).emit('game-result', {
-                    hostMove: match.hostMove,
-                    opponentMove: match.opponentMove,
-                    winner: winner
-                });
-                
-                const index = activeMatches.findIndex(m => m.matchCode === data.matchCode);
-                if (index !== -1) activeMatches.splice(index, 1);
-            }
-        }
-    });
-    
-    socket.on('send-sticker', (data) => {
-        io.to(data.matchCode).emit('new-sticker', { username: data.username, sticker: data.sticker });
     });
     
     socket.on('disconnect', () => {
@@ -1018,31 +679,16 @@ io.on('connection', (socket) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 
-initData().then(() => {
-    server.listen(PORT, '0.0.0.0', () => {
-        console.log('\n========================================');
-        console.log('💰 RPS CYBER ARENA - COMPLETE ECONOMY');
-        console.log('========================================');
-        console.log(`✅ Server running on port ${PORT}`);
-        console.log('========================================');
-        console.log('💵 COIN EARNING METHODS:');
-        console.log('   • Win a match: 50 coins');
-        console.log('   • Loss participation: 10 coins');
-        console.log('   • 3-win streak bonus: +20 coins');
-        console.log('   • 5-win streak bonus: +40 coins');
-        console.log('   • Level up reward: Level × 50 coins');
-        console.log('   • Daily login: 100-500 coins');
-        console.log('========================================');
-        console.log('📈 LEVEL SYSTEM (1-50):');
-        console.log('   • Level 1: 0 wins');
-        console.log('   • Level 10: 50 wins');
-        console.log('   • Level 25: 170 wins');
-        console.log('   • Level 50: 470 wins');
-        console.log('========================================');
-        console.log('📋 LOGIN CREDENTIALS:');
-        console.log('   Admin: admin / Peaceking (100,000 coins)');
-        console.log('   Test: CyberWarrior / player123 (2,500 coins)');
-        console.log('   Test: NeonRookie / player123 (200 coins)');
-        console.log('========================================\n');
-    });
+server.listen(PORT, '0.0.0.0', () => {
+    console.log('\n========================================');
+    console.log('🎮 RPS CYBER ARENA - NEON DATABASE');
+    console.log('========================================');
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`🗄️  Database: Neon PostgreSQL`);
+    console.log(`🎯 10-Round Match Sessions: ACTIVE`);
+    console.log('========================================');
+    console.log('📋 LOGIN CREDENTIALS:');
+    console.log('   Admin: admin / Peaceking');
+    console.log('   Test: CyberWarrior / player123');
+    console.log('========================================\n');
 });
