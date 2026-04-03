@@ -4,7 +4,6 @@ const socketIo = require('socket.io');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 const app = express();
@@ -28,49 +27,52 @@ app.use(express.json());
 
 const JWT_SECRET = 'kirinyaga_secret_key_2025';
 
-// ============ DATABASE TABLES (In-Memory) ============
-
-// Users table
+// ============ DATABASE TABLES ============
 const users = [];
 let nextUserId = 1;
 
-// Friendships table
+// Friendships
 const friendships = [];
 let nextFriendshipId = 1;
 
-// Friend Requests table
+// Friend Requests
 const friendRequests = [];
 let nextFriendRequestId = 1;
 
-// Game Sessions table
+// Game Sessions
 const gameSessions = [];
 let nextGameSessionId = 1;
 
-// Matches table
+// Matches
 const matches = [];
 let nextMatchId = 1;
 
-// Replays table
+// Replays
 const replays = [];
 let nextReplayId = 1;
 
-// Tournaments table
+// Tournaments
 const tournaments = [];
 let nextTournamentId = 1;
 
-// Tournament Participants table
+// Tournament Participants
 const tournamentParticipants = [];
 
-// Power-ups table
+// Power-ups
 const userPowerups = [];
 let nextPowerupId = 1;
 
+// Daily Rewards Log
+const dailyRewards = [];
+let nextDailyRewardId = 1;
+
 // Available Power-ups
 const availablePowerups = [
-    { id: 'double_points', name: 'Double Points', description: 'Win gives 2x MMR', icon: 'fa-bolt', cost: 500, duration: 3 },
-    { id: 'shield', name: 'Shield', description: 'Loss doesn\'t reduce MMR', icon: 'fa-shield-alt', cost: 300, duration: 1 },
+    { id: 'double_points', name: 'Double Points', description: 'Win gives 2x coins', icon: 'fa-bolt', cost: 500, duration: 3 },
+    { id: 'shield', name: 'Shield', description: 'Loss doesn\'t reduce streak', icon: 'fa-shield-alt', cost: 300, duration: 1 },
     { id: 'prediction', name: 'Prediction', description: 'See opponent\'s move', icon: 'fa-eye', cost: 400, duration: 1 },
-    { id: 'lucky_charm', name: 'Lucky Charm', description: 'Higher win chance', icon: 'fa-clover', cost: 600, duration: 5 }
+    { id: 'lucky_charm', name: 'Lucky Charm', description: 'Higher win chance', icon: 'fa-clover', cost: 600, duration: 5 },
+    { id: 'coin_boost', name: 'Coin Boost', description: 'Earn 2x coins for 5 matches', icon: 'fa-coins', cost: 800, duration: 5 }
 ];
 
 // Active Matches for Multiplayer
@@ -79,6 +81,197 @@ const matchmakingQueue = [];
 
 // Online Users
 let onlineUsers = [];
+
+// Level requirements (wins needed for each level)
+const levelRequirements = {
+    1: 0, 2: 5, 3: 10, 4: 15, 5: 20, 6: 26, 7: 32, 8: 38, 9: 44, 10: 50,
+    11: 57, 12: 64, 13: 71, 14: 78, 15: 85, 16: 93, 17: 101, 18: 109, 19: 117, 20: 125,
+    21: 134, 22: 143, 23: 152, 24: 161, 25: 170, 26: 180, 27: 190, 28: 200, 29: 210, 30: 220,
+    31: 231, 32: 242, 33: 253, 34: 264, 35: 275, 36: 287, 37: 299, 38: 311, 39: 323, 40: 335,
+    41: 348, 42: 361, 43: 374, 44: 387, 45: 400, 46: 414, 47: 428, 48: 442, 49: 456, 50: 470
+};
+
+// Coin rewards for wins
+const winRewards = {
+    win: 50,
+    streak_bonus: 20,
+    perfect_win: 100,
+    comeback: 75
+};
+
+// Daily login rewards
+const dailyRewardAmounts = {
+    1: 100, 2: 150, 3: 200, 4: 250, 5: 300, 6: 400, 7: 500
+};
+
+// ============ HELPER FUNCTIONS ============
+function getLevelFromWins(wins) {
+    for (let level = 50; level >= 1; level--) {
+        if (wins >= levelRequirements[level]) {
+            return level;
+        }
+    }
+    return 1;
+}
+
+function getWinsNeededForNextLevel(currentWins) {
+    for (let level = 1; level <= 50; level++) {
+        if (currentWins < levelRequirements[level]) {
+            return levelRequirements[level] - currentWins;
+        }
+    }
+    return 0;
+}
+
+function getLevelUpReward(level) {
+    return level * 50; // 50 coins per level
+}
+
+function calculateCoinReward(won, streak, isPerfect = false, isComeback = false) {
+    if (!won) return 10; // Participation coins even on loss
+    
+    let reward = winRewards.win;
+    if (streak >= 3) reward += winRewards.streak_bonus;
+    if (streak >= 5) reward += winRewards.streak_bonus * 2;
+    if (streak >= 10) reward += winRewards.streak_bonus * 3;
+    if (isPerfect) reward += winRewards.perfect_win;
+    if (isComeback) reward += winRewards.comeback;
+    
+    return reward;
+}
+
+function findUserById(id) {
+    return users.find(u => u.id === id);
+}
+
+function findUserByUsername(username) {
+    return users.find(u => u.username === username);
+}
+
+function updateUserStats(userId, won, isPerfect = false, isComeback = false) {
+    const user = findUserById(userId);
+    if (!user) return;
+    
+    const previousLevel = getLevelFromWins(user.total_wins);
+    
+    if (won) {
+        user.total_wins++;
+        // Calculate coin reward
+        const reward = calculateCoinReward(true, user.win_streak, isPerfect, isComeback);
+        user.coins += reward;
+        user.win_streak++;
+        user.total_earned_coins += reward;
+        
+        // Update MMR
+        user.mmr += 25;
+    } else {
+        user.total_games++;
+        user.coins += 10; // Participation coins
+        user.win_streak = 0;
+        user.mmr = Math.max(0, user.mmr - 25);
+    }
+    
+    user.total_games++;
+    
+    // Update level
+    const newLevel = getLevelFromWins(user.total_wins);
+    if (newLevel > previousLevel) {
+        const levelUpReward = getLevelUpReward(newLevel);
+        user.coins += levelUpReward;
+        user.level = newLevel;
+        user.level_up_message = `Congratulations! You reached Level ${newLevel} and earned ${levelUpReward} coins!`;
+    } else {
+        user.level = newLevel;
+    }
+    
+    // Update rank based on MMR
+    if (user.mmr >= 3000) user.rank = 'Legend';
+    else if (user.mmr >= 2500) user.rank = 'Master';
+    else if (user.mmr >= 2000) user.rank = 'Diamond';
+    else if (user.mmr >= 1500) user.rank = 'Platinum';
+    else if (user.mmr >= 1000) user.rank = 'Gold';
+    else if (user.mmr >= 500) user.rank = 'Silver';
+    else user.rank = 'Bronze';
+    
+    // Update badge
+    if (user.total_wins >= 500) user.badge = 'Legend';
+    else if (user.total_wins >= 250) user.badge = 'Master';
+    else if (user.total_wins >= 100) user.badge = 'Diamond';
+    else if (user.total_wins >= 50) user.badge = 'Platinum';
+    else if (user.total_wins >= 25) user.badge = 'Gold';
+    else if (user.total_wins >= 10) user.badge = 'Silver';
+    else user.badge = 'Bronze';
+    
+    return {
+        coins_earned: won ? calculateCoinReward(true, user.win_streak - 1, isPerfect, isComeback) : 10,
+        new_level: newLevel > previousLevel,
+        level_up_reward: newLevel > previousLevel ? getLevelUpReward(newLevel) : 0,
+        wins_needed_next: getWinsNeededForNextLevel(user.total_wins)
+    };
+}
+
+function addMatch(player1Id, player2Id, winnerId, player1Move, player2Move, gameType, mmrChange, coinsEarned = 0) {
+    const match = {
+        id: nextMatchId++,
+        player1_id: player1Id,
+        player2_id: player2Id,
+        winner_id: winnerId,
+        player1_move: player1Move,
+        player2_move: player2Move,
+        game_type: gameType,
+        mmr_change: mmrChange,
+        coins_earned: coinsEarned,
+        created_at: new Date().toISOString()
+    };
+    matches.push(match);
+    
+    // Create replay
+    replays.push({
+        id: nextReplayId++,
+        match_id: match.id,
+        moves: JSON.stringify([{ player1: player1Move, player2: player2Move, winner: winnerId }]),
+        created_at: new Date().toISOString()
+    });
+    
+    return match;
+}
+
+// ============ DAILY REWARDS ============
+function claimDailyReward(userId) {
+    const user = findUserById(userId);
+    if (!user) return { success: false, error: 'User not found' };
+    
+    const today = new Date().toDateString();
+    const lastClaim = user.last_daily_claim ? new Date(user.last_daily_claim).toDateString() : null;
+    
+    if (lastClaim === today) {
+        return { success: false, error: 'Already claimed today' };
+    }
+    
+    let streak = user.daily_streak || 0;
+    if (lastClaim === new Date(Date.now() - 86400000).toDateString()) {
+        streak++;
+    } else {
+        streak = 1;
+    }
+    
+    if (streak > 7) streak = 7;
+    
+    const reward = dailyRewardAmounts[streak] || 100;
+    user.coins += reward;
+    user.daily_streak = streak;
+    user.last_daily_claim = new Date().toISOString();
+    
+    dailyRewards.push({
+        id: nextDailyRewardId++,
+        user_id: userId,
+        reward: reward,
+        streak: streak,
+        claimed_at: new Date().toISOString()
+    });
+    
+    return { success: true, reward: reward, streak: streak, total_coins: user.coins };
+}
 
 // ============ INITIALIZE DATA ============
 async function initData() {
@@ -98,7 +291,11 @@ async function initData() {
         rank: 'Legend',
         is_banned: false,
         avatar: 'dragon',
-        coins: 10000,
+        coins: 100000,
+        win_streak: 0,
+        daily_streak: 0,
+        total_earned_coins: 100000,
+        last_daily_claim: null,
         created_at: new Date().toISOString()
     });
     
@@ -127,141 +324,18 @@ async function initData() {
             is_banned: false,
             avatar: user.avatar,
             coins: user.coins,
+            win_streak: 0,
+            daily_streak: 0,
+            total_earned_coins: user.coins,
+            last_daily_claim: null,
             created_at: new Date().toISOString()
         });
     }
     
-    // Create sample friendships
-    friendships.push({
-        id: nextFriendshipId++,
-        user_id1: 2,
-        user_id2: 3,
-        status: 'accepted',
-        created_at: new Date().toISOString()
-    });
-    
-    // Create sample friend requests
-    friendRequests.push({
-        id: nextFriendRequestId++,
-        from_id: 3,
-        to_id: 4,
-        status: 'pending',
-        created_at: new Date().toISOString()
-    });
-    
-    // Create sample matches
-    matches.push({
-        id: nextMatchId++,
-        player1_id: 2,
-        player2_id: 3,
-        winner_id: 2,
-        player1_move: 'rock',
-        player2_move: 'scissors',
-        game_type: 'ranked',
-        mmr_change: 25,
-        created_at: new Date().toISOString()
-    });
-    
-    // Create sample replay
-    replays.push({
-        id: nextReplayId++,
-        match_id: 1,
-        moves: JSON.stringify([{ round: 1, player1: 'rock', player2: 'scissors', winner: 2 }]),
-        created_at: new Date().toISOString()
-    });
-    
-    // Create sample tournament
-    tournaments.push({
-        id: nextTournamentId++,
-        name: 'Weekly Championship',
-        host_id: 2,
-        status: 'waiting',
-        max_players: 8,
-        current_players: 4,
-        prize_pool: 1000,
-        created_at: new Date().toISOString()
-    });
-    
     console.log('✅ Database initialized with', users.length, 'users');
-    console.log('   Friendships:', friendships.length);
-    console.log('   Matches:', matches.length);
-    console.log('   Tournaments:', tournaments.length);
-}
-
-// ============ HELPER FUNCTIONS ============
-function findUserById(id) {
-    return users.find(u => u.id === id);
-}
-
-function findUserByUsername(username) {
-    return users.find(u => u.username === username);
-}
-
-function addMatch(player1Id, player2Id, winnerId, player1Move, player2Move, gameType, mmrChange) {
-    const match = {
-        id: nextMatchId++,
-        player1_id: player1Id,
-        player2_id: player2Id,
-        winner_id: winnerId,
-        player1_move: player1Move,
-        player2_move: player2Move,
-        game_type: gameType,
-        mmr_change: mmrChange,
-        created_at: new Date().toISOString()
-    };
-    matches.push(match);
-    
-    // Create replay
-    replays.push({
-        id: nextReplayId++,
-        match_id: match.id,
-        moves: JSON.stringify([{ player1: player1Move, player2: player2Move, winner: winnerId }]),
-        created_at: new Date().toISOString()
-    });
-    
-    return match;
-}
-
-function addGameSession(player1Id, player2Id, gameType) {
-    const session = {
-        id: nextGameSessionId++,
-        player1_id: player1Id,
-        player2_id: player2Id,
-        game_type: gameType,
-        status: 'active',
-        created_at: new Date().toISOString()
-    };
-    gameSessions.push(session);
-    return session;
-}
-
-function updateUserStats(userId, won, mmrChange = 0) {
-    const user = findUserById(userId);
-    if (user) {
-        if (won) user.total_wins++;
-        user.total_games++;
-        user.mmr += mmrChange;
-        if (user.mmr < 0) user.mmr = 0;
-        
-        // Update rank based on MMR
-        if (user.mmr >= 3000) user.rank = 'Legend';
-        else if (user.mmr >= 2500) user.rank = 'Master';
-        else if (user.mmr >= 2000) user.rank = 'Diamond';
-        else if (user.mmr >= 1500) user.rank = 'Platinum';
-        else if (user.mmr >= 1000) user.rank = 'Gold';
-        else if (user.mmr >= 500) user.rank = 'Silver';
-        else user.rank = 'Bronze';
-        
-        // Update badge based on wins
-        if (user.total_wins >= 500) user.badge = 'Legend';
-        else if (user.total_wins >= 250) user.badge = 'Master';
-        else if (user.total_wins >= 100) user.badge = 'Diamond';
-        else if (user.total_wins >= 50) user.badge = 'Platinum';
-        else if (user.total_wins >= 25) user.badge = 'Gold';
-        else if (user.total_wins >= 10) user.badge = 'Silver';
-        
-        user.level = Math.floor(user.total_wins / 5) + 1;
-    }
+    console.log('   Level requirements configured for levels 1-50');
+    console.log('   Coin rewards: Win=' + winRewards.win + ', Streak bonus=' + winRewards.streak_bonus);
+    console.log('   Daily rewards: Day 1-7 = 100-500 coins');
 }
 
 // ============ USER ROUTES ============
@@ -294,7 +368,11 @@ app.post('/api/register', async (req, res) => {
         rank: 'Bronze',
         is_banned: false,
         avatar: 'ninja',
-        coins: 100,
+        coins: 500, // Starting coins
+        win_streak: 0,
+        daily_streak: 0,
+        total_earned_coins: 500,
+        last_daily_claim: null,
         created_at: new Date().toISOString()
     };
     users.push(newUser);
@@ -321,12 +399,14 @@ app.post('/api/login', async (req, res) => {
         user: {
             id: user.id, username: user.username, role: user.role,
             badge: user.badge, level: user.level, total_wins: user.total_wins,
-            mmr: user.mmr, rank: user.rank, coins: user.coins, avatar: user.avatar
+            mmr: user.mmr, rank: user.rank, coins: user.coins, avatar: user.avatar,
+            win_streak: user.win_streak, daily_streak: user.daily_streak || 0,
+            wins_needed_next: getWinsNeededForNextLevel(user.total_wins)
         }
     });
 });
 
-// Get user stats
+// Get user stats (includes level progression)
 app.get('/api/user/stats', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
@@ -337,49 +417,100 @@ app.get('/api/user/stats', (req, res) => {
         res.json({
             username: user.username, badge: user.badge, level: user.level,
             total_wins: user.total_wins, total_games: user.total_games,
-            mmr: user.mmr, rank: user.rank, coins: user.coins, avatar: user.avatar
+            mmr: user.mmr, rank: user.rank, coins: user.coins, avatar: user.avatar,
+            win_streak: user.win_streak, daily_streak: user.daily_streak || 0,
+            total_earned_coins: user.total_earned_coins,
+            wins_needed_next: getWinsNeededForNextLevel(user.total_wins),
+            next_level_wins: levelRequirements[user.level + 1] || levelRequirements[50],
+            current_level_wins: levelRequirements[user.level] || 0
         });
     } catch (error) {
         res.status(403).json({ error: 'Invalid token' });
     }
 });
 
-// Play vs Computer
+// Claim daily reward
+app.post('/api/daily-reward', (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Token required' });
+    
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const result = claimDailyReward(decoded.id);
+        res.json(result);
+    } catch (error) {
+        res.status(403).json({ error: 'Invalid token' });
+    }
+});
+
+// Play vs Computer (with coin rewards and level tracking)
 app.post('/api/game/computer', (req, res) => {
-    const { playerMove, difficulty } = req.body;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Token required' });
     
-    let computerMove;
-    const moves = ['rock', 'paper', 'scissors'];
-    
-    if (difficulty === 'easy') {
-        computerMove = moves[Math.floor(Math.random() * 3)];
-    } else if (difficulty === 'medium') {
-        computerMove = moves[Math.floor(Math.random() * 3)];
-        if (Math.random() > 0.6) {
-            if (playerMove === 'rock') computerMove = 'paper';
-            else if (playerMove === 'paper') computerMove = 'scissors';
-            else computerMove = 'rock';
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const { playerMove, difficulty } = req.body;
+        
+        let computerMove;
+        const moves = ['rock', 'paper', 'scissors'];
+        
+        if (difficulty === 'easy') {
+            computerMove = moves[Math.floor(Math.random() * 3)];
+        } else if (difficulty === 'medium') {
+            computerMove = moves[Math.floor(Math.random() * 3)];
+            if (Math.random() > 0.6) {
+                if (playerMove === 'rock') computerMove = 'paper';
+                else if (playerMove === 'paper') computerMove = 'scissors';
+                else computerMove = 'rock';
+            }
+        } else {
+            computerMove = moves[Math.floor(Math.random() * 3)];
+            if (Math.random() > 0.4) {
+                if (playerMove === 'rock') computerMove = 'paper';
+                else if (playerMove === 'paper') computerMove = 'scissors';
+                else computerMove = 'rock';
+            }
         }
-    } else {
-        computerMove = moves[Math.floor(Math.random() * 3)];
-        if (Math.random() > 0.4) {
-            if (playerMove === 'rock') computerMove = 'paper';
-            else if (playerMove === 'paper') computerMove = 'scissors';
-            else computerMove = 'rock';
+        
+        let result = 'tie';
+        let won = false;
+        
+        if (playerMove === computerMove) {
+            result = 'tie';
+        } else if ((playerMove === 'rock' && computerMove === 'scissors') ||
+                   (playerMove === 'paper' && computerMove === 'rock') ||
+                   (playerMove === 'scissors' && computerMove === 'paper')) {
+            result = 'win';
+            won = true;
+        } else {
+            result = 'lose';
         }
+        
+        // Update user stats with rewards
+        const statsUpdate = updateUserStats(decoded.id, won, false, false);
+        const updatedUser = findUserById(decoded.id);
+        
+        res.json({ 
+            result, 
+            computerMove, 
+            playerMove,
+            coins_earned: statsUpdate?.coins_earned || (won ? 50 : 10),
+            level_up: statsUpdate?.new_level || false,
+            level_up_reward: statsUpdate?.level_up_reward || 0,
+            new_level: updatedUser?.level,
+            wins_needed_next: getWinsNeededForNextLevel(updatedUser?.total_wins || 0),
+            total_coins: updatedUser?.coins,
+            win_streak: updatedUser?.win_streak
+        });
+    } catch (error) {
+        res.status(403).json({ error: 'Invalid token' });
     }
-    
-    let result = 'tie';
-    if (playerMove === computerMove) result = 'tie';
-    else if ((playerMove === 'rock' && computerMove === 'scissors') ||
-             (playerMove === 'paper' && computerMove === 'rock') ||
-             (playerMove === 'scissors' && computerMove === 'paper')) {
-        result = 'win';
-    } else {
-        result = 'lose';
-    }
-    
-    res.json({ result, computerMove, playerMove });
+});
+
+// Get level requirements
+app.get('/api/level-requirements', (req, res) => {
+    res.json(levelRequirements);
 });
 
 // Leaderboard
@@ -390,7 +521,8 @@ app.get('/api/leaderboard', (req, res) => {
         .slice(0, 20)
         .map((u, i) => ({
             rank: i + 1, username: u.username, wins: u.total_wins,
-            mmr: u.mmr, badge: u.badge, avatar: u.avatar, level: u.level
+            mmr: u.mmr, badge: u.badge, avatar: u.avatar, level: u.level,
+            coins: u.coins
         }));
     res.json(leaderboard);
 });
@@ -409,8 +541,9 @@ app.get('/api/match-history', (req, res) => {
             const opponent = findUserById(opponentId);
             return {
                 result: isWinner ? 'win' : (m.winner_id === null ? 'tie' : 'lose'),
-                opponent: opponent ? opponent.username : 'Unknown',
+                opponent: opponent ? opponent.username : 'Computer',
                 mmrChange: m.mmr_change || 0,
+                coinsEarned: m.coins_earned || 0,
                 timestamp: m.created_at
             };
         });
@@ -432,9 +565,7 @@ app.get('/api/verify-token', (req, res) => {
     }
 });
 
-// ============ FRIEND SYSTEM ROUTES ============
-
-// Send friend request
+// ============ FRIEND SYSTEM ============
 app.post('/api/friends/request', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
@@ -467,7 +598,6 @@ app.post('/api/friends/request', (req, res) => {
     }
 });
 
-// Accept friend request
 app.post('/api/friends/accept/:requestId', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
@@ -495,7 +625,6 @@ app.post('/api/friends/accept/:requestId', (req, res) => {
     }
 });
 
-// Get friends list
 app.get('/api/friends/list', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
@@ -509,14 +638,14 @@ app.get('/api/friends/list', (req, res) => {
         }).filter(f => f);
         
         res.json(friends.map(f => ({
-            id: f.id, username: f.username, avatar: f.avatar, rank: f.rank, online: onlineUsers.some(u => u.userId === f.id)
+            id: f.id, username: f.username, avatar: f.avatar, rank: f.rank, 
+            online: onlineUsers.some(u => u.userId === f.id), level: f.level
         })));
     } catch (error) {
         res.status(403).json({ error: 'Invalid token' });
     }
 });
 
-// Get pending friend requests
 app.get('/api/friends/requests', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
@@ -534,14 +663,11 @@ app.get('/api/friends/requests', (req, res) => {
     }
 });
 
-// ============ POWER-UP ROUTES ============
-
-// Get available power-ups
+// ============ POWER-UPS ============
 app.get('/api/powerups', (req, res) => {
     res.json(availablePowerups);
 });
 
-// Buy power-up
 app.post('/api/powerups/buy', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
@@ -571,7 +697,6 @@ app.post('/api/powerups/buy', (req, res) => {
     }
 });
 
-// Get user's power-ups
 app.get('/api/user/powerups', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
@@ -589,33 +714,7 @@ app.get('/api/user/powerups', (req, res) => {
     }
 });
 
-// Use power-up
-app.post('/api/powerups/use', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
-    
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const { powerUpId, matchId } = req.body;
-        const userPowerup = userPowerups.find(p => p.user_id === decoded.id && p.powerup_id === powerUpId);
-        
-        if (!userPowerup || userPowerup.quantity < 1) return res.status(400).json({ error: 'No power-up available' });
-        
-        userPowerup.quantity--;
-        if (userPowerup.quantity === 0) {
-            const index = userPowerups.findIndex(p => p.id === userPowerup.id);
-            if (index !== -1) userPowerups.splice(index, 1);
-        }
-        
-        res.json({ success: true, message: 'Power-up activated!' });
-    } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
-    }
-});
-
-// ============ TOURNAMENT ROUTES ============
-
-// Create tournament
+// ============ TOURNAMENTS ============
 app.post('/api/tournament/create', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
@@ -650,7 +749,6 @@ app.post('/api/tournament/create', (req, res) => {
     }
 });
 
-// Join tournament
 app.post('/api/tournament/join', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token required' });
@@ -673,10 +771,8 @@ app.post('/api/tournament/join', (req, res) => {
             joined_at: new Date().toISOString()
         });
         
-        // Auto-start if full
         if (tournament.current_players === tournament.max_players) {
             tournament.status = 'active';
-            // Create bracket
             const participants = tournamentParticipants.filter(p => p.tournament_id === tournament.id);
             const shuffled = [...participants];
             for (let i = shuffled.length - 1; i > 0; i--) {
@@ -692,7 +788,6 @@ app.post('/api/tournament/join', (req, res) => {
     }
 });
 
-// Get tournament info
 app.get('/api/tournament/:id', (req, res) => {
     const tournament = tournaments.find(t => t.id === parseInt(req.params.id));
     if (!tournament) return res.status(404).json({ error: 'Tournament not found' });
@@ -701,40 +796,47 @@ app.get('/api/tournament/:id', (req, res) => {
     res.json({ ...tournament, participants });
 });
 
-// Get all active tournaments
 app.get('/api/tournaments', (req, res) => {
     const activeTournaments = tournaments.filter(t => t.status === 'waiting');
     res.json(activeTournaments);
 });
 
-// ============ REPLAY ROUTES ============
-
-// Get replay
-app.get('/api/replay/:id', (req, res) => {
-    const replay = replays.find(r => r.id === parseInt(req.params.id));
-    if (!replay) return res.status(404).json({ error: 'Replay not found' });
+// ============ ACHIEVEMENTS ============
+app.get('/api/achievements', (req, res) => {
+    const achievements = [
+        { id: 'first_blood', name: 'First Blood', description: 'Win your first match', icon: 'fa-trophy', requirement: 1 },
+        { id: 'warrior', name: 'Warrior', description: 'Win 10 matches', icon: 'fa-shield-alt', requirement: 10 },
+        { id: 'legendary', name: 'Legendary', description: 'Win 50 matches', icon: 'fa-crown', requirement: 50 },
+        { id: 'veteran', name: 'Veteran', description: 'Play 100 matches', icon: 'fa-star', requirement: 100 },
+        { id: 'millionaire', name: 'Millionaire', description: 'Earn 1000 coins', icon: 'fa-coins', requirement: 1000 },
+        { id: 'streak_master', name: 'Streak Master', description: 'Win 5 in a row', icon: 'fa-fire', requirement: 5 }
+    ];
     
-    const match = matches.find(m => m.id === replay.match_id);
-    res.json({ replay, match });
-});
-
-// Get user replays
-app.get('/api/user/replays', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token required' });
+    if (!token) return res.json(achievements.map(a => ({ ...a, unlocked: false })));
     
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        const userMatches = matches.filter(m => m.player1_id === decoded.id || m.player2_id === decoded.id);
-        const userReplays = replays.filter(r => userMatches.some(m => m.id === r.match_id));
-        res.json(userReplays);
+        const user = findUserById(decoded.id);
+        
+        const unlockedAchievements = achievements.map(a => {
+            let unlocked = false;
+            if (a.id === 'first_blood' && user.total_wins >= 1) unlocked = true;
+            if (a.id === 'warrior' && user.total_wins >= 10) unlocked = true;
+            if (a.id === 'legendary' && user.total_wins >= 50) unlocked = true;
+            if (a.id === 'veteran' && user.total_games >= 100) unlocked = true;
+            if (a.id === 'millionaire' && user.total_earned_coins >= 1000) unlocked = true;
+            if (a.id === 'streak_master' && user.win_streak >= 5) unlocked = true;
+            return { ...a, unlocked };
+        });
+        
+        res.json(unlockedAchievements);
     } catch (error) {
-        res.status(403).json({ error: 'Invalid token' });
+        res.json(achievements.map(a => ({ ...a, unlocked: false })));
     }
 });
 
 // ============ ADMIN ROUTES ============
-
 app.post('/api/admin/login', async (req, res) => {
     const { username, password } = req.body;
     const user = findUserByUsername(username);
@@ -785,18 +887,6 @@ app.get('/api/admin/total-users', (req, res) => {
     res.json({ count });
 });
 
-app.get('/api/admin/reports', (req, res) => {
-    res.json([]);
-});
-
-app.delete('/api/admin/clear-reports', (req, res) => {
-    res.json({ success: true });
-});
-
-app.get('/api/admin/logs', (req, res) => {
-    res.json([]);
-});
-
 // Update avatar
 app.post('/api/update-avatar', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
@@ -813,21 +903,7 @@ app.post('/api/update-avatar', (req, res) => {
     }
 });
 
-// ============ ACHIEVEMENTS ============
-app.get('/api/achievements', (req, res) => {
-    const achievements = [
-        { id: 'first_blood', name: 'First Blood', description: 'Win your first match', icon: 'fa-trophy', unlocked: true },
-        { id: 'warrior', name: 'Warrior', description: 'Win 10 matches', icon: 'fa-shield-alt', unlocked: false },
-        { id: 'legendary', name: 'Legendary', description: 'Win 50 matches', icon: 'fa-crown', unlocked: false },
-        { id: 'veteran', name: 'Veteran', description: 'Play 100 matches', icon: 'fa-star', unlocked: false },
-        { id: 'social', name: 'Social Butterfly', description: 'Add 5 friends', icon: 'fa-users', unlocked: false },
-        { id: 'tournament_winner', name: 'Champion', description: 'Win a tournament', icon: 'fa-trophy', unlocked: false }
-    ];
-    res.json(achievements);
-});
-
-// ============ SOCKET.IO WITH MATCHMAKING ============
-
+// ============ SOCKET.IO ============
 io.on('connection', (socket) => {
     console.log('Client connected:', socket.id);
     let currentUserId = null;
@@ -836,17 +912,13 @@ io.on('connection', (socket) => {
         currentUserId = data.userId;
         onlineUsers.push({ userId: data.userId, username: data.username, socketId: socket.id });
         io.emit('online-count', { count: onlineUsers.length });
-        console.log('User online:', data.username, 'Total online:', onlineUsers.length);
     });
     
-    // Matchmaking for ranked
     socket.on('join-matchmaking', (data) => {
         if (!matchmakingQueue.includes(data.userId)) {
             matchmakingQueue.push({ userId: data.userId, username: data.username, socketId: socket.id });
-            console.log('Player joined queue:', data.username, 'Queue size:', matchmakingQueue.length);
         }
         
-        // Try to find match every 2 seconds
         const checkMatch = setInterval(() => {
             if (matchmakingQueue.length >= 2) {
                 const player1 = matchmakingQueue.shift();
@@ -854,18 +926,11 @@ io.on('connection', (socket) => {
                 
                 if (player1 && player2) {
                     const matchCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-                    const match = {
-                        matchCode,
-                        player1: player1,
-                        player2: player2,
-                        status: 'active'
-                    };
+                    const match = { matchCode, player1, player2, status: 'active' };
                     activeMatches.push(match);
                     
                     io.to(player1.socketId).emit('match-found', { matchCode, opponent: player2.username });
                     io.to(player2.socketId).emit('match-found', { matchCode, opponent: player1.username });
-                    
-                    console.log('Match found:', player1.username, 'vs', player2.username);
                     clearInterval(checkMatch);
                 }
             }
@@ -875,26 +940,16 @@ io.on('connection', (socket) => {
             const index = matchmakingQueue.findIndex(p => p.userId === data.userId);
             if (index !== -1) matchmakingQueue.splice(index, 1);
             clearInterval(checkMatch);
-            socket.emit('left-matchmaking');
         });
     });
     
-    // Create casual match
     socket.on('create-match', (data) => {
         const matchCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-        activeMatches.push({
-            matchCode,
-            hostId: data.userId,
-            hostName: data.username,
-            hostSocket: socket.id,
-            status: 'waiting'
-        });
+        activeMatches.push({ matchCode, hostId: data.userId, hostName: data.username, hostSocket: socket.id, status: 'waiting' });
         socket.join(matchCode);
         socket.emit('match-created', { matchCode });
-        console.log('Match created:', matchCode, 'by', data.username);
     });
     
-    // Join casual match
     socket.on('join-match', (data) => {
         const match = activeMatches.find(m => m.matchCode === data.matchCode && m.status === 'waiting');
         if (match) {
@@ -906,43 +961,33 @@ io.on('connection', (socket) => {
             socket.join(data.matchCode);
             io.to(match.hostSocket).emit('match-started', { matchCode: data.matchCode });
             socket.emit('match-started', { matchCode: data.matchCode });
-            console.log('Match joined:', data.username, 'joined', data.matchCode);
         } else {
-            socket.emit('join-error', { error: 'Match not found or already started' });
+            socket.emit('join-error', { error: 'Match not found' });
         }
     });
     
-    // Make move in match
     socket.on('make-move', (data) => {
         const match = activeMatches.find(m => m.matchCode === data.matchCode);
         if (match) {
-            if (match.hostId === data.userId) {
-                match.hostMove = data.move;
-            } else {
-                match.opponentMove = data.move;
-            }
+            if (match.hostId === data.userId) match.hostMove = data.move;
+            else match.opponentMove = data.move;
             
             if (match.hostMove && match.opponentMove) {
                 let winner = null;
-                if (match.hostMove === match.opponentMove) {
-                    winner = 'tie';
-                } else if (
-                    (match.hostMove === 'rock' && match.opponentMove === 'scissors') ||
-                    (match.hostMove === 'paper' && match.opponentMove === 'rock') ||
-                    (match.hostMove === 'scissors' && match.opponentMove === 'paper')
-                ) {
+                if (match.hostMove === match.opponentMove) winner = 'tie';
+                else if ((match.hostMove === 'rock' && match.opponentMove === 'scissors') ||
+                         (match.hostMove === 'paper' && match.opponentMove === 'rock') ||
+                         (match.hostMove === 'scissors' && match.opponentMove === 'paper')) {
                     winner = match.hostId;
                 } else {
                     winner = match.opponentId;
                 }
                 
-                // Update stats
                 if (winner !== 'tie') {
-                    updateUserStats(winner, true, 25);
+                    const winnerUser = findUserById(winner);
                     const loserId = winner === match.hostId ? match.opponentId : match.hostId;
-                    updateUserStats(loserId, false, -25);
-                    
-                    // Add to matches history
+                    updateUserStats(winner, true);
+                    updateUserStats(loserId, false);
                     addMatch(match.hostId, match.opponentId, winner, match.hostMove, match.opponentMove, 'casual', winner === match.hostId ? 25 : -25);
                 }
                 
@@ -952,15 +997,12 @@ io.on('connection', (socket) => {
                     winner: winner
                 });
                 
-                // Clean up match
                 const index = activeMatches.findIndex(m => m.matchCode === data.matchCode);
                 if (index !== -1) activeMatches.splice(index, 1);
-                console.log('Match completed:', data.matchCode);
             }
         }
     });
     
-    // Send sticker
     socket.on('send-sticker', (data) => {
         io.to(data.matchCode).emit('new-sticker', { username: data.username, sticker: data.sticker });
     });
@@ -970,7 +1012,6 @@ io.on('connection', (socket) => {
         const queueIndex = matchmakingQueue.findIndex(p => p.socketId === socket.id);
         if (queueIndex !== -1) matchmakingQueue.splice(queueIndex, 1);
         io.emit('online-count', { count: onlineUsers.length });
-        console.log('Client disconnected:', socket.id);
     });
 });
 
@@ -980,26 +1021,28 @@ const PORT = process.env.PORT || 3000;
 initData().then(() => {
     server.listen(PORT, '0.0.0.0', () => {
         console.log('\n========================================');
-        console.log('🎮 RPS CYBER ARENA - COMPLETE BACKEND');
+        console.log('💰 RPS CYBER ARENA - COMPLETE ECONOMY');
         console.log('========================================');
         console.log(`✅ Server running on port ${PORT}`);
-        console.log(`🌐 Accepting connections from Vercel`);
         console.log('========================================');
-        console.log('📊 DATABASE TABLES:');
-        console.log(`   Users: ${users.length}`);
-        console.log(`   Friendships: ${friendships.length}`);
-        console.log(`   Friend Requests: ${friendRequests.length}`);
-        console.log(`   Game Sessions: ${gameSessions.length}`);
-        console.log(`   Matches: ${matches.length}`);
-        console.log(`   Replays: ${replays.length}`);
-        console.log(`   Tournaments: ${tournaments.length}`);
-        console.log(`   Power-ups: ${availablePowerups.length}`);
+        console.log('💵 COIN EARNING METHODS:');
+        console.log('   • Win a match: 50 coins');
+        console.log('   • Loss participation: 10 coins');
+        console.log('   • 3-win streak bonus: +20 coins');
+        console.log('   • 5-win streak bonus: +40 coins');
+        console.log('   • Level up reward: Level × 50 coins');
+        console.log('   • Daily login: 100-500 coins');
+        console.log('========================================');
+        console.log('📈 LEVEL SYSTEM (1-50):');
+        console.log('   • Level 1: 0 wins');
+        console.log('   • Level 10: 50 wins');
+        console.log('   • Level 25: 170 wins');
+        console.log('   • Level 50: 470 wins');
         console.log('========================================');
         console.log('📋 LOGIN CREDENTIALS:');
-        console.log('   Admin: admin / Peaceking');
-        console.log('   Test: CyberWarrior / player123');
-        console.log('   Test: NeonRookie / player123');
-        console.log('   Test: GlitchMaster / player123');
+        console.log('   Admin: admin / Peaceking (100,000 coins)');
+        console.log('   Test: CyberWarrior / player123 (2,500 coins)');
+        console.log('   Test: NeonRookie / player123 (200 coins)');
         console.log('========================================\n');
     });
 });
