@@ -1,7 +1,7 @@
 {
-  "name": "rps-cyber-arena-backend",
+  "name": "rps-backend",
   "version": "1.0.0",
-  "description": "Rock Paper Scissors Game Backend with Neon PostgreSQL",
+  "description": "RPS Cyber Arena Backend with Neon PostgreSQL",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -18,5 +18,17 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
-  }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "rock-paper-scissors",
+    "game",
+    "neon",
+    "postgresql",
+    "multiplayer"
+  ],
+  "author": "Kirinyaga University",
+  "license": "MIT"
 }
