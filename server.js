@@ -174,7 +174,29 @@ app.get('/api/user/stats', async (req, res) => {
         res.status(403).json({ error: 'Invalid token' });
     }
 });
-
+// Add this to your server.js - Check if user is banned
+app.get('/api/user/status', async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+        return res.status(401).json({ error: 'Token required' });
+    }
+    
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const result = await pool.query('SELECT is_banned FROM users WHERE id = $1', [decoded.id]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        res.json({ 
+            is_banned: result.rows[0].is_banned,
+            username: decoded.username
+        });
+    } catch (error) {
+        res.status(403).json({ error: 'Invalid token' });
+    }
+});
 // ============ LEADERBOARD ============
 app.get('/api/leaderboard', async (req, res) => {
     try {
