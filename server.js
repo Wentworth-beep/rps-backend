@@ -13,7 +13,7 @@ const server = http.createServer(app);
 // CORS for Vercel frontend
 const io = socketIo(server, {
     cors: {
-        origin: ['https://rps-fronthead.vercel.app', 'http://localhost:3000', 'http://localhost:3001'],
+        origin: ['https://rps-fronthead.vercel.app', 'http://localhost:3000', 'http://localhost:3001', '*'],
         methods: ["GET", "POST"],
         credentials: true
     },
@@ -21,14 +21,14 @@ const io = socketIo(server, {
 });
 
 app.use(cors({
-    origin: ['https://rps-fronthead.vercel.app', 'http://localhost:3000', 'http://localhost:3001'],
+    origin: ['https://rps-fronthead.vercel.app', 'http://localhost:3000', 'http://localhost:3001', '*'],
     credentials: true
 }));
 app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'kirinyaga_secret_key_2025';
 
-// ============ IN-MEMORY FALLBACK (for when database is down) ============
+// ============ IN-MEMORY DATABASE (Working without Neon) ============
 const memoryDB = {
     users: [],
     matches: [],
@@ -37,6 +37,7 @@ const memoryDB = {
 
 // Initialize in-memory users
 async function initMemoryDB() {
+    // Create admin user
     const adminHash = await bcrypt.hash('Peaceking', 10);
     memoryDB.users.push({
         id: memoryDB.nextId++,
@@ -52,107 +53,85 @@ async function initMemoryDB() {
         rank: 'Grandmaster',
         is_banned: false,
         avatar: 'dragon',
-        coins: 10000
+        coins: 10000,
+        win_streak: 0,
+        created_at: new Date().toISOString()
     });
     
+    // Create sample users
     const playerHash = await bcrypt.hash('player123', 10);
-    memoryDB.users.push({
-        id: memoryDB.nextId++,
-        username: 'CyberWarrior',
-        email: 'warrior@test.com',
-        password_hash: playerHash,
-        role: 'user',
-        badge: 'Master',
-        level: 25,
-        total_wins: 150,
-        total_games: 200,
-        mmr: 2200,
-        rank: 'Master',
-        is_banned: false,
-        avatar: 'ninja',
-        coins: 2500
-    });
+    const sampleUsers = [
+        { username: 'CyberWarrior', email: 'warrior@test.com', badge: 'Master', level: 25, wins: 150, mmr: 2200, rank: 'Master', avatar: 'ninja', coins: 2500 },
+        { username: 'NeonRookie', email: 'rookie@test.com', badge: 'Bronze', level: 3, wins: 8, mmr: 450, rank: 'Bronze', avatar: 'robot', coins: 200 },
+        { username: 'GlitchMaster', email: 'glitch@test.com', badge: 'Gold', level: 12, wins: 60, mmr: 1200, rank: 'Gold', avatar: 'wizard', coins: 800 }
+    ];
     
-    memoryDB.users.push({
-        id: memoryDB.nextId++,
-        username: 'NeonRookie',
-        email: 'rookie@test.com',
-        password_hash: playerHash,
-        role: 'user',
-        badge: 'Bronze',
-        level: 3,
-        total_wins: 8,
-        total_games: 20,
-        mmr: 450,
-        rank: 'Bronze',
-        is_banned: false,
-        avatar: 'robot',
-        coins: 200
-    });
-    
-    console.log('✅ In-memory database initialized');
-}
-
-// Try Neon connection, fallback to memory
-let db = null;
-let useMemory = true;
-
-async function connectToNeon() {
-    try {
-        const pool = new Pool({
-            connectionString: process.env.DATABASE_URL,
-            ssl: { rejectUnauthorized: false },
-            connectionTimeoutMillis: 5000
+    for (const user of sampleUsers) {
+        memoryDB.users.push({
+            id: memoryDB.nextId++,
+            username: user.username,
+            email: user.email,
+            password_hash: playerHash,
+            role: 'user',
+            badge: user.badge,
+            level: user.level,
+            total_wins: user.wins,
+            total_games: user.wins + 50,
+            mmr: user.mmr,
+            rank: user.rank,
+            is_banned: false,
+            avatar: user.avatar,
+            coins: user.coins,
+            win_streak: 0,
+            created_at: new Date().toISOString()
         });
-        
-        await pool.query('SELECT NOW()');
-        console.log('✅ Connected to Neon PostgreSQL');
-        useMemory = false;
-        return pool;
-    } catch (err) {
-        console.log('⚠️ Neon connection failed, using in-memory storage');
-        await initMemoryDB();
-        return null;
     }
+    
+    console.log('✅ In-memory database initialized with', memoryDB.users.length, 'users');
 }
-
-// Initialize database connection
-let pool;
-connectToNeon().then(p => {
-    pool = p;
-});
 
 // ============ HELPER FUNCTIONS ============
-async function findUserByUsername(username) {
-    if (!useMemory && pool) {
-        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-        return result.rows[0];
-    } else {
-        return memoryDB.users.find(u => u.username === username);
-    }
+function findUserByUsername(username) {
+    return memoryDB.users.find(u => u.username === username);
 }
 
-async function findUserById(id) {
-    if (!useMemory && pool) {
-        const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
-        return result.rows[0];
-    } else {
-        return memoryDB.users.find(u => u.id === id);
-    }
+function findUserById(id) {
+    return memoryDB.users.find(u => u.id === id);
 }
 
-async function createUser(username, email, passwordHash) {
-    if (!useMemory && pool) {
-        const result = await pool.query(
-            'INSERT INTO users (username, email, password_hash, role, badge, level, coins, avatar) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, username, role, badge, level, coins, avatar',
-            [username, email, passwordHash, 'user', 'Bronze', 1, 500, 'ninja']
-        );
-        return result.rows[0];
-    } else {
+// ============ USER ROUTES ============
+
+// Register - WORKING
+app.post('/api/register', async (req, res) => {
+    const { username, email, password } = req.body;
+    console.log('📝 Register attempt:', username, email);
+    
+    // Validation
+    if (!username || !email || !password) {
+        return res.status(400).json({ error: 'All fields are required' });
+    }
+    if (password.length < 4) {
+        return res.status(400).json({ error: 'Password must be at least 4 characters' });
+    }
+    if (!email.includes('@')) {
+        return res.status(400).json({ error: 'Please enter a valid email address' });
+    }
+    
+    try {
+        // Check if user exists
+        const existing = findUserByUsername(username);
+        if (existing) {
+            return res.status(400).json({ error: 'Username already exists' });
+        }
+        
+        // Hash password
+        const passwordHash = await bcrypt.hash(password, 10);
+        
+        // Create new user
         const newUser = {
             id: memoryDB.nextId++,
-            username,
-            email,
+            username: username,
+            email: email,
             password_hash: passwordHash,
             role: 'user',
             badge: 'Bronze',
@@ -163,108 +142,51 @@ async function createUser(username, email, passwordHash) {
             rank: 'Bronze',
             is_banned: false,
             avatar: 'ninja',
-            coins: 500
+            coins: 500,
+            win_streak: 0,
+            created_at: new Date().toISOString()
         };
         memoryDB.users.push(newUser);
-        return newUser;
-    }
-}
-
-async function updateUserStats(userId, won, coinsEarned) {
-    if (!useMemory && pool) {
-        if (won) {
-            await pool.query('UPDATE users SET total_wins = total_wins + 1, total_games = total_games + 1, coins = coins + $1, win_streak = win_streak + 1, mmr = mmr + 25 WHERE id = $2', [coinsEarned, userId]);
-        } else {
-            await pool.query('UPDATE users SET total_games = total_games + 1, coins = coins + $1, win_streak = 0, mmr = GREATEST(mmr - 25, 0) WHERE id = $2', [coinsEarned, userId]);
-        }
-    } else {
-        const user = memoryDB.users.find(u => u.id === userId);
-        if (user) {
-            if (won) {
-                user.total_wins++;
-                user.win_streak++;
-                user.mmr += 25;
-            } else {
-                user.win_streak = 0;
-                user.mmr = Math.max(0, user.mmr - 25);
-            }
-            user.total_games++;
-            user.coins += coinsEarned;
-        }
-    }
-}
-
-async function saveMatch(player1Id, player2Id, winnerId, player1Move, player2Move, gameType, mmrChange, coinsEarned) {
-    if (!useMemory && pool) {
-        await pool.query(
-            'INSERT INTO matches (player1_id, player2_id, winner_id, player1_move, player2_move, game_type, mmr_change, coins_earned) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-            [player1Id, player2Id, winnerId, player1Move, player2Move, gameType, mmrChange, coinsEarned]
-        );
-    } else {
-        memoryDB.matches.push({
-            id: memoryDB.matches.length + 1,
-            player1_id: player1Id,
-            player2_id: player2Id,
-            winner_id: winnerId,
-            player1_move: player1Move,
-            player2_move: player2Move,
-            game_type: gameType,
-            mmr_change: mmrChange,
-            coins_earned: coinsEarned,
-            created_at: new Date()
-        });
-    }
-}
-
-// ============ USER ROUTES ============
-
-// Register
-app.post('/api/register', async (req, res) => {
-    const { username, email, password } = req.body;
-    console.log('Register attempt:', username, email);
-    
-    if (!username || !email || !password) {
-        return res.status(400).json({ error: 'All fields required' });
-    }
-    if (password.length < 4) {
-        return res.status(400).json({ error: 'Password must be at least 4 characters' });
-    }
-    
-    try {
-        const existing = await findUserByUsername(username);
-        if (existing) {
-            return res.status(400).json({ error: 'Username already exists' });
-        }
         
-        const passwordHash = await bcrypt.hash(password, 10);
-        const newUser = await createUser(username, email, passwordHash);
-        
+        // Generate token
         const token = jwt.sign(
             { id: newUser.id, username: newUser.username, role: newUser.role },
             JWT_SECRET,
             { expiresIn: '24h' }
         );
         
-        console.log(`✅ User registered: ${username}`);
-        res.json({ success: true, token, user: newUser });
+        console.log(`✅ User registered successfully: ${username}`);
+        res.json({
+            success: true,
+            token,
+            user: {
+                id: newUser.id,
+                username: newUser.username,
+                role: newUser.role,
+                badge: newUser.badge,
+                level: newUser.level,
+                coins: newUser.coins,
+                avatar: newUser.avatar
+            }
+        });
     } catch (error) {
         console.error('Registration error:', error);
-        res.status(500).json({ error: 'Registration failed' });
+        res.status(500).json({ error: 'Registration failed. Please try again.' });
     }
 });
 
-// Login
+// Login - WORKING
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
-    console.log('Login attempt:', username);
+    console.log('🔐 Login attempt:', username);
     
     try {
-        const user = await findUserByUsername(username);
+        const user = findUserByUsername(username);
         if (!user) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         if (user.is_banned) {
-            return res.status(403).json({ error: 'Account banned' });
+            return res.status(403).json({ error: 'Account has been banned' });
         }
         
         const valid = await bcrypt.compare(password, user.password_hash);
@@ -288,12 +210,12 @@ app.post('/api/login', async (req, res) => {
                 role: user.role,
                 badge: user.badge,
                 level: user.level,
-                total_wins: user.total_wins || 0,
-                mmr: user.mmr || 500,
-                rank: user.rank || 'Bronze',
-                coins: user.coins || 500,
-                avatar: user.avatar || 'ninja',
-                win_streak: user.win_streak || 0
+                total_wins: user.total_wins,
+                mmr: user.mmr,
+                rank: user.rank,
+                coins: user.coins,
+                avatar: user.avatar,
+                win_streak: user.win_streak
             }
         });
     } catch (error) {
@@ -302,7 +224,7 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// Get user stats
+// Get user stats - WORKING
 app.get('/api/user/stats', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) {
@@ -311,7 +233,7 @@ app.get('/api/user/stats', async (req, res) => {
     
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        const user = await findUserById(decoded.id);
+        const user = findUserById(decoded.id);
         
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
@@ -321,13 +243,13 @@ app.get('/api/user/stats', async (req, res) => {
             username: user.username,
             badge: user.badge,
             level: user.level,
-            total_wins: user.total_wins || 0,
-            total_games: user.total_games || 0,
-            mmr: user.mmr || 500,
-            rank: user.rank || 'Bronze',
-            coins: user.coins || 500,
-            avatar: user.avatar || 'ninja',
-            win_streak: user.win_streak || 0
+            total_wins: user.total_wins,
+            total_games: user.total_games,
+            mmr: user.mmr,
+            rank: user.rank,
+            coins: user.coins,
+            avatar: user.avatar,
+            win_streak: user.win_streak
         });
     } catch (error) {
         console.error('Stats error:', error);
@@ -335,7 +257,7 @@ app.get('/api/user/stats', async (req, res) => {
     }
 });
 
-// Play vs Computer
+// Play vs Computer - WORKING
 app.post('/api/game/computer', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) {
@@ -346,7 +268,7 @@ app.post('/api/game/computer', async (req, res) => {
         const decoded = jwt.verify(token, JWT_SECRET);
         const { playerMove, difficulty } = req.body;
         
-        // Get computer move
+        // Computer AI
         let computerMove;
         const moves = ['rock', 'paper', 'scissors'];
         
@@ -368,6 +290,7 @@ app.post('/api/game/computer', async (req, res) => {
             }
         }
         
+        // Determine winner
         let result = 'tie';
         let won = false;
         let coinsEarned = 10;
@@ -385,21 +308,60 @@ app.post('/api/game/computer', async (req, res) => {
         }
         
         // Update user stats
-        await updateUserStats(decoded.id, won, coinsEarned);
+        const user = findUserById(decoded.id);
+        if (user) {
+            if (won) {
+                user.total_wins++;
+                user.win_streak++;
+                user.mmr += 25;
+            } else {
+                user.win_streak = 0;
+                user.mmr = Math.max(0, user.mmr - 25);
+            }
+            user.total_games++;
+            user.coins += coinsEarned;
+            
+            // Update badge based on wins
+            if (user.total_wins >= 500) user.badge = 'Legend';
+            else if (user.total_wins >= 250) user.badge = 'Master';
+            else if (user.total_wins >= 100) user.badge = 'Diamond';
+            else if (user.total_wins >= 50) user.badge = 'Platinum';
+            else if (user.total_wins >= 25) user.badge = 'Gold';
+            else if (user.total_wins >= 10) user.badge = 'Silver';
+            
+            user.level = Math.floor(user.total_wins / 5) + 1;
+            
+            // Update rank based on MMR
+            if (user.mmr >= 3000) user.rank = 'Legend';
+            else if (user.mmr >= 2500) user.rank = 'Master';
+            else if (user.mmr >= 2000) user.rank = 'Diamond';
+            else if (user.mmr >= 1500) user.rank = 'Platinum';
+            else if (user.mmr >= 1000) user.rank = 'Gold';
+            else if (user.mmr >= 500) user.rank = 'Silver';
+            else user.rank = 'Bronze';
+        }
         
         // Save match
-        await saveMatch(decoded.id, null, won ? decoded.id : null, playerMove, computerMove, 'computer', won ? 25 : -25, coinsEarned);
-        
-        // Get updated user
-        const updatedUser = await findUserById(decoded.id);
+        memoryDB.matches.push({
+            id: memoryDB.matches.length + 1,
+            player1_id: decoded.id,
+            player2_id: null,
+            winner_id: won ? decoded.id : null,
+            player1_move: playerMove,
+            player2_move: computerMove,
+            game_type: 'computer',
+            mmr_change: won ? 25 : -25,
+            coins_earned: coinsEarned,
+            created_at: new Date().toISOString()
+        });
         
         res.json({
             result,
             computerMove,
             playerMove,
             coins_earned: coinsEarned,
-            total_coins: updatedUser.coins,
-            win_streak: updatedUser.win_streak || 0
+            total_coins: user.coins,
+            win_streak: user.win_streak
         });
     } catch (error) {
         console.error('Game error:', error);
@@ -407,41 +369,32 @@ app.post('/api/game/computer', async (req, res) => {
     }
 });
 
-// Leaderboard
+// Leaderboard - WORKING
 app.get('/api/leaderboard', async (req, res) => {
     try {
-        if (!useMemory && pool) {
-            const result = await pool.query(
-                `SELECT id, username, total_wins as wins, mmr, badge, avatar, level, coins
-                 FROM users WHERE role = 'user' 
-                 ORDER BY mmr DESC LIMIT 20`
-            );
-            res.json(result.rows.map((u, i) => ({ ...u, rank: i + 1 })));
-        } else {
-            const leaderboard = [...memoryDB.users]
-                .filter(u => u.role === 'user')
-                .sort((a, b) => b.mmr - a.mmr)
-                .slice(0, 20)
-                .map((u, i) => ({
-                    rank: i + 1,
-                    id: u.id,
-                    username: u.username,
-                    wins: u.total_wins,
-                    mmr: u.mmr,
-                    badge: u.badge,
-                    avatar: u.avatar,
-                    level: u.level,
-                    coins: u.coins
-                }));
-            res.json(leaderboard);
-        }
+        const leaderboard = [...memoryDB.users]
+            .filter(u => u.role === 'user')
+            .sort((a, b) => b.mmr - a.mmr)
+            .slice(0, 20)
+            .map((u, i) => ({
+                rank: i + 1,
+                id: u.id,
+                username: u.username,
+                wins: u.total_wins,
+                mmr: u.mmr,
+                badge: u.badge,
+                avatar: u.avatar,
+                level: u.level,
+                coins: u.coins
+            }));
+        res.json(leaderboard);
     } catch (error) {
         console.error('Leaderboard error:', error);
         res.status(500).json({ error: 'Failed to fetch leaderboard' });
     }
 });
 
-// Match history
+// Match history - WORKING
 app.get('/api/match-history', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) {
@@ -450,45 +403,27 @@ app.get('/api/match-history', async (req, res) => {
     
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        
-        if (!useMemory && pool) {
-            const result = await pool.query(
-                `SELECT m.*, 
-                 CASE WHEN m.winner_id = $1 THEN 'win' ELSE 'lose' END as result,
-                 COALESCE(u.username, 'Computer') as opponent,
-                 m.mmr_change,
-                 m.coins_earned,
-                 m.created_at as timestamp
-                 FROM matches m
-                 LEFT JOIN users u ON (CASE WHEN m.player1_id = $1 THEN m.player2_id ELSE m.player1_id END) = u.id
-                 WHERE m.player1_id = $1 OR m.player2_id = $1
-                 ORDER BY m.created_at DESC LIMIT 20`,
-                [decoded.id]
-            );
-            res.json(result.rows);
-        } else {
-            const userMatches = memoryDB.matches.filter(m => m.player1_id === decoded.id || m.player2_id === decoded.id);
-            const history = userMatches.slice(0, 20).map(m => {
-                const isWinner = m.winner_id === decoded.id;
-                const opponentId = m.player1_id === decoded.id ? m.player2_id : m.player1_id;
-                const opponent = memoryDB.users.find(u => u.id === opponentId);
-                return {
-                    result: isWinner ? 'win' : 'lose',
-                    opponent: opponent ? opponent.username : 'Computer',
-                    mmr_change: m.mmr_change,
-                    coins_earned: m.coins_earned,
-                    timestamp: m.created_at
-                };
-            });
-            res.json(history);
-        }
+        const userMatches = memoryDB.matches.filter(m => m.player1_id === decoded.id || m.player2_id === decoded.id);
+        const history = userMatches.slice(0, 20).map(m => {
+            const isWinner = m.winner_id === decoded.id;
+            const opponentId = m.player1_id === decoded.id ? m.player2_id : m.player1_id;
+            const opponent = memoryDB.users.find(u => u.id === opponentId);
+            return {
+                result: isWinner ? 'win' : 'lose',
+                opponent: opponent ? opponent.username : 'Computer',
+                mmr_change: m.mmr_change,
+                coins_earned: m.coins_earned,
+                timestamp: m.created_at
+            };
+        });
+        res.json(history);
     } catch (error) {
         console.error('Match history error:', error);
         res.status(403).json({ error: 'Invalid token' });
     }
 });
 
-// Update avatar
+// Update avatar - WORKING
 app.post('/api/update-avatar', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) {
@@ -498,21 +433,15 @@ app.post('/api/update-avatar', async (req, res) => {
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
         const { avatar } = req.body;
-        
-        if (!useMemory && pool) {
-            await pool.query('UPDATE users SET avatar = $1 WHERE id = $2', [avatar, decoded.id]);
-        } else {
-            const user = memoryDB.users.find(u => u.id === decoded.id);
-            if (user) user.avatar = avatar;
-        }
-        
+        const user = findUserById(decoded.id);
+        if (user) user.avatar = avatar;
         res.json({ success: true });
     } catch (error) {
         res.status(403).json({ error: 'Invalid token' });
     }
 });
 
-// Verify token
+// Verify token - WORKING
 app.get('/api/verify-token', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) {
@@ -521,12 +450,10 @@ app.get('/api/verify-token', async (req, res) => {
     
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        const user = await findUserById(decoded.id);
-        
+        const user = findUserById(decoded.id);
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
-        
         res.json({ valid: true, user: { id: user.id, username: user.username, role: user.role } });
     } catch (error) {
         res.status(403).json({ error: 'Invalid token' });
@@ -534,12 +461,14 @@ app.get('/api/verify-token', async (req, res) => {
 });
 
 // ============ ADMIN ROUTES ============
+
+// Admin login
 app.post('/api/admin/login', async (req, res) => {
     const { username, password } = req.body;
-    console.log('Admin login attempt:', username);
+    console.log('👑 Admin login attempt:', username);
     
     try {
-        const user = await findUserByUsername(username);
+        const user = findUserByUsername(username);
         if (!user || user.role !== 'admin') {
             return res.status(401).json({ error: 'Invalid admin credentials' });
         }
@@ -562,6 +491,7 @@ app.post('/api/admin/login', async (req, res) => {
     }
 });
 
+// Get all users (admin only)
 app.get('/api/admin/users', async (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) {
@@ -574,68 +504,54 @@ app.get('/api/admin/users', async (req, res) => {
             return res.status(403).json({ error: 'Admin only' });
         }
         
-        if (!useMemory && pool) {
-            const result = await pool.query('SELECT id, username, email, role, badge, level, total_wins, mmr, is_banned, avatar, coins FROM users');
-            res.json(result.rows);
-        } else {
-            const users = memoryDB.users.map(u => ({
-                id: u.id,
-                username: u.username,
-                email: u.email,
-                role: u.role,
-                badge: u.badge,
-                level: u.level,
-                total_wins: u.total_wins,
-                mmr: u.mmr,
-                is_banned: u.is_banned,
-                avatar: u.avatar,
-                coins: u.coins
-            }));
-            res.json(users);
-        }
+        const users = memoryDB.users.map(u => ({
+            id: u.id,
+            username: u.username,
+            email: u.email,
+            role: u.role,
+            badge: u.badge,
+            level: u.level,
+            total_wins: u.total_wins,
+            mmr: u.mmr,
+            is_banned: u.is_banned,
+            avatar: u.avatar,
+            coins: u.coins
+        }));
+        res.json(users);
     } catch (error) {
         res.status(403).json({ error: 'Invalid token' });
     }
 });
 
+// Ban/unban user
 app.post('/api/admin/ban-user', async (req, res) => {
     const { userId, ban } = req.body;
-    
-    if (!useMemory && pool) {
-        await pool.query('UPDATE users SET is_banned = $1 WHERE id = $2 AND role != $3', [ban, userId, 'admin']);
-    } else {
-        const user = memoryDB.users.find(u => u.id === userId);
-        if (user && user.role !== 'admin') user.is_banned = ban;
+    const user = findUserById(userId);
+    if (user && user.role !== 'admin') {
+        user.is_banned = ban;
     }
-    
     res.json({ success: true });
 });
 
+// Update badge
 app.post('/api/admin/update-badge', async (req, res) => {
     const { userId, badge } = req.body;
-    
-    if (!useMemory && pool) {
-        await pool.query('UPDATE users SET badge = $1 WHERE id = $2', [badge, userId]);
-    } else {
-        const user = memoryDB.users.find(u => u.id === userId);
-        if (user) user.badge = badge;
+    const user = findUserById(userId);
+    if (user) {
+        user.badge = badge;
     }
-    
     res.json({ success: true });
 });
 
+// Get online count
 app.get('/api/admin/online-count', (req, res) => {
     res.json({ count: onlineUsers.size });
 });
 
-app.get('/api/admin/total-users', async (req, res) => {
-    if (!useMemory && pool) {
-        const result = await pool.query("SELECT COUNT(*) as count FROM users WHERE role = 'user'");
-        res.json({ count: parseInt(result.rows[0].count) });
-    } else {
-        const count = memoryDB.users.filter(u => u.role === 'user').length;
-        res.json({ count });
-    }
+// Get total users
+app.get('/api/admin/total-users', (req, res) => {
+    const count = memoryDB.users.filter(u => u.role === 'user').length;
+    res.json({ count });
 });
 
 // ============ SOCKET.IO ============
@@ -643,12 +559,12 @@ const onlineUsers = new Map();
 const activeSessions = {};
 
 io.on('connection', (socket) => {
-    console.log('Client connected:', socket.id);
+    console.log('🔌 Client connected:', socket.id);
     
     socket.on('user-online', (data) => {
         onlineUsers.set(socket.id, data);
         io.emit('online-count', { count: onlineUsers.size });
-        console.log('User online:', data.username, 'Total:', onlineUsers.size);
+        console.log('👤 User online:', data.username, 'Total:', onlineUsers.size);
     });
     
     socket.on('create-match', (data) => {
@@ -663,7 +579,7 @@ io.on('connection', (socket) => {
         };
         socket.join(matchCode);
         socket.emit('match-created', { matchCode });
-        console.log('Match created:', matchCode, 'by', data.username);
+        console.log('🎮 Match created:', matchCode, 'by', data.username);
     });
     
     socket.on('join-match', (data) => {
@@ -673,7 +589,7 @@ io.on('connection', (socket) => {
             session.status = 'active';
             socket.join(data.matchCode);
             io.to(data.matchCode).emit('match-started', { matchCode: data.matchCode });
-            console.log('Match joined:', data.username, 'joined', data.matchCode);
+            console.log('🎮 Match joined:', data.username, 'joined', data.matchCode);
         } else {
             socket.emit('join-error', { error: 'Match not found' });
         }
@@ -688,7 +604,7 @@ io.on('connection', (socket) => {
                 winner: data.userId
             });
             delete activeSessions[data.matchCode];
-            console.log('Move made in match:', data.matchCode);
+            console.log('🎮 Move made in match:', data.matchCode);
         }
     });
     
@@ -699,28 +615,38 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         onlineUsers.delete(socket.id);
         io.emit('online-count', { count: onlineUsers.size });
-        console.log('Client disconnected:', socket.id);
+        console.log('🔌 Client disconnected:', socket.id);
     });
 });
 
 // Health check endpoint
 app.get('/', (req, res) => {
-    res.json({ status: 'online', message: 'RPS Cyber Arena API is running', timestamp: new Date().toISOString() });
+    res.json({ 
+        status: 'online', 
+        message: 'RPS Cyber Arena API is running',
+        users: memoryDB.users.length,
+        timestamp: new Date().toISOString()
+    });
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log('\n========================================');
-    console.log('🎮 RPS CYBER ARENA BACKEND');
-    console.log('========================================');
-    console.log(`✅ Server running on port ${PORT}`);
-    console.log(`🌐 URL: http://localhost:${PORT}`);
-    console.log('========================================');
-    console.log('📋 LOGIN CREDENTIALS:');
-    console.log('   Admin: admin / Peaceking');
-    console.log('   Test: CyberWarrior / player123');
-    console.log('   Test: NeonRookie / player123');
-    console.log('========================================\n');
+// Initialize database and start server
+initMemoryDB().then(() => {
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log('\n========================================');
+        console.log('🎮 RPS CYBER ARENA BACKEND');
+        console.log('========================================');
+        console.log(`✅ Server running on port ${PORT}`);
+        console.log(`🌐 URL: http://localhost:${PORT}`);
+        console.log(`👥 Users in database: ${memoryDB.users.length}`);
+        console.log('========================================');
+        console.log('📋 LOGIN CREDENTIALS:');
+        console.log('   👑 Admin: admin / Peaceking');
+        console.log('   🎮 Test: CyberWarrior / player123');
+        console.log('   🎮 Test: NeonRookie / player123');
+        console.log('   🎮 Test: GlitchMaster / player123');
+        console.log('========================================\n');
+    });
 });
