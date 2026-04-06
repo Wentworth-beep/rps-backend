@@ -51,7 +51,6 @@ app.post('/api/register', async (req, res) => {
     const { username, email, password } = req.body;
     console.log('📝 Register attempt:', { username, email });
     
-    // Validation
     if (!username || !email || !password) {
         return res.status(400).json({ error: 'All fields are required' });
     }
@@ -60,31 +59,27 @@ app.post('/api/register', async (req, res) => {
     }
     
     try {
-        // Check if user exists
         const existing = await pool.query('SELECT id FROM users WHERE username = $1 OR email = $2', [username, email]);
         if (existing.rows.length > 0) {
             return res.status(400).json({ error: 'Username or email already exists' });
         }
         
-        // Hash password
         const passwordHash = await bcrypt.hash(password, 10);
         
-        // Insert new user
         const result = await pool.query(
-            `INSERT INTO users (username, email, password_hash, role, badge, level, total_wins, total_games, mmr, rank, coins, avatar)
-             VALUES ($1, $2, $3, 'user', 'Bronze', 1, 0, 0, 500, 'Bronze', 500, 'ninja')
-             RETURNING id, username, role, badge, level`,
+            `INSERT INTO users (username, email, password_hash, role, badge, level, total_wins, total_games, mmr, rank, coins, avatar, win_streak)
+             VALUES ($1, $2, $3, 'user', 'Bronze', 1, 0, 0, 500, 'Bronze', 500, 'ninja', 0)
+             RETURNING id, username, role, badge, level, coins, avatar, mmr, rank`,
             [username, email, passwordHash]
         );
         
-        // Generate JWT token
         const token = jwt.sign(
             { id: result.rows[0].id, username: result.rows[0].username, role: result.rows[0].role },
             JWT_SECRET,
             { expiresIn: '24h' }
         );
         
-        console.log(`✅ User registered successfully: ${username}`);
+        console.log(`✅ User registered: ${username}`);
         res.json({ 
             success: true, 
             token, 
@@ -109,7 +104,6 @@ app.post('/api/login', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
         if (result.rows.length === 0) {
-            console.log('❌ User not found:', username);
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         
@@ -120,9 +114,10 @@ app.post('/api/login', async (req, res) => {
         
         const valid = await bcrypt.compare(password, user.password_hash);
         if (!valid) {
-            console.log('❌ Invalid password for:', username);
             return res.status(401).json({ error: 'Invalid credentials' });
         }
+        
+        await pool.query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
         
         const token = jwt.sign(
             { id: user.id, username: user.username, role: user.role },
@@ -140,11 +135,12 @@ app.post('/api/login', async (req, res) => {
                 role: user.role,
                 badge: user.badge,
                 level: user.level,
-                total_wins: user.total_wins || 0,
-                mmr: user.mmr || 500,
-                rank: user.rank || 'Bronze',
-                coins: user.coins || 500,
-                avatar: user.avatar || 'ninja'
+                total_wins: user.total_wins,
+                mmr: user.mmr,
+                rank: user.rank,
+                coins: user.coins,
+                avatar: user.avatar,
+                win_streak: user.win_streak
             }
         });
     } catch (error) {
@@ -163,7 +159,7 @@ app.get('/api/user/stats', async (req, res) => {
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
         const result = await pool.query(
-            `SELECT username, badge, level, total_wins, total_games, mmr, rank, coins, avatar
+            `SELECT username, badge, level, total_wins, total_games, mmr, rank, coins, avatar, win_streak
              FROM users WHERE id = $1`,
             [decoded.id]
         );
@@ -250,6 +246,110 @@ app.get('/api/verify-token', async (req, res) => {
     }
 });
 
+// ============ PLAY VS COMPUTER ============
+app.post('/api/game/computer', async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+        return res.status(401).json({ error: 'Token required' });
+    }
+    
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const { playerMove, difficulty } = req.body;
+        
+        let computerMove;
+        const moves = ['rock', 'paper', 'scissors'];
+        
+        if (difficulty === 'easy') {
+            computerMove = moves[Math.floor(Math.random() * 3)];
+        } else if (difficulty === 'medium') {
+            computerMove = moves[Math.floor(Math.random() * 3)];
+            if (Math.random() > 0.6) {
+                if (playerMove === 'rock') computerMove = 'paper';
+                else if (playerMove === 'paper') computerMove = 'scissors';
+                else computerMove = 'rock';
+            }
+        } else {
+            computerMove = moves[Math.floor(Math.random() * 3)];
+            if (Math.random() > 0.4) {
+                if (playerMove === 'rock') computerMove = 'paper';
+                else if (playerMove === 'paper') computerMove = 'scissors';
+                else computerMove = 'rock';
+            }
+        }
+        
+        let result = 'tie';
+        let won = false;
+        let coinsEarned = 10;
+        
+        if (playerMove === computerMove) {
+            result = 'tie';
+        } else if ((playerMove === 'rock' && computerMove === 'scissors') ||
+                   (playerMove === 'paper' && computerMove === 'rock') ||
+                   (playerMove === 'scissors' && computerMove === 'paper')) {
+            result = 'win';
+            won = true;
+            coinsEarned = 50;
+        } else {
+            result = 'lose';
+        }
+        
+        const userResult = await pool.query('SELECT total_wins, win_streak, coins, mmr FROM users WHERE id = $1', [decoded.id]);
+        const user = userResult.rows[0];
+        
+        let newWinStreak = user.win_streak;
+        let newTotalWins = user.total_wins;
+        
+        if (won) {
+            if (user.win_streak >= 2) coinsEarned += 20;
+            if (user.win_streak >= 4) coinsEarned += 40;
+            newWinStreak = user.win_streak + 1;
+            newTotalWins = user.total_wins + 1;
+            
+            await pool.query(
+                `UPDATE users SET 
+                    total_wins = total_wins + 1, 
+                    total_games = total_games + 1, 
+                    coins = coins + $1,
+                    win_streak = $2,
+                    mmr = mmr + 25
+                 WHERE id = $3`,
+                [coinsEarned, newWinStreak, decoded.id]
+            );
+        } else if (result === 'lose') {
+            newWinStreak = 0;
+            await pool.query(
+                `UPDATE users SET 
+                    total_games = total_games + 1, 
+                    coins = coins + $1,
+                    win_streak = $2,
+                    mmr = GREATEST(mmr - 25, 0)
+                 WHERE id = $3`,
+                [10, 0, decoded.id]
+            );
+        } else {
+            await pool.query(
+                `UPDATE users SET total_games = total_games + 1, coins = coins + $1 WHERE id = $2`,
+                [10, decoded.id]
+            );
+        }
+        
+        const updatedUser = await pool.query('SELECT coins, level, total_wins FROM users WHERE id = $1', [decoded.id]);
+        
+        res.json({
+            result,
+            computerMove,
+            playerMove,
+            coins_earned: coinsEarned,
+            total_coins: updatedUser.rows[0].coins,
+            win_streak: newWinStreak
+        });
+    } catch (error) {
+        console.error('Game error:', error);
+        res.status(500).json({ error: 'Game failed' });
+    }
+});
+
 // ============ ADMIN ROUTES ============
 app.post('/api/admin/login', async (req, res) => {
     const { username, password } = req.body;
@@ -286,7 +386,7 @@ app.get('/api/admin/users', async (req, res) => {
         const decoded = jwt.verify(token, JWT_SECRET);
         if (decoded.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
         
-        const result = await pool.query('SELECT id, username, email, role, badge, level, total_wins, mmr, is_banned, avatar FROM users');
+        const result = await pool.query('SELECT id, username, email, role, badge, level, total_wins, mmr, is_banned, avatar, coins FROM users');
         res.json(result.rows);
     } catch (error) {
         res.status(403).json({ error: 'Invalid token' });
@@ -376,76 +476,14 @@ io.on('connection', (socket) => {
 // ============ START SERVER ============
 const PORT = process.env.PORT || 3000;
 
-// Initialize database tables
-async function initDatabase() {
-    try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(50) UNIQUE NOT NULL,
-                email VARCHAR(100) UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                role VARCHAR(20) DEFAULT 'user',
-                badge VARCHAR(50) DEFAULT 'Bronze',
-                level INTEGER DEFAULT 1,
-                total_wins INTEGER DEFAULT 0,
-                total_games INTEGER DEFAULT 0,
-                mmr INTEGER DEFAULT 500,
-                rank VARCHAR(50) DEFAULT 'Bronze',
-                coins INTEGER DEFAULT 500,
-                avatar VARCHAR(50) DEFAULT 'ninja',
-                theme VARCHAR(50) DEFAULT 'cyberpunk',
-                win_streak INTEGER DEFAULT 0,
-                is_banned BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login TIMESTAMP
-            )
-        `);
-        
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS matches (
-                id SERIAL PRIMARY KEY,
-                player1_id INTEGER REFERENCES users(id),
-                player2_id INTEGER REFERENCES users(id),
-                winner_id INTEGER REFERENCES users(id),
-                player1_move VARCHAR(10),
-                player2_move VARCHAR(10),
-                game_type VARCHAR(20),
-                mmr_change INTEGER,
-                coins_earned INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-        
-        // Create admin user if not exists
-        const adminCheck = await pool.query('SELECT * FROM users WHERE username = $1', ['admin']);
-        if (adminCheck.rows.length === 0) {
-            const adminPasswordHash = await bcrypt.hash('Peaceking', 10);
-            await pool.query(
-                `INSERT INTO users (username, email, password_hash, role, badge, level, total_wins, mmr, rank, coins, avatar)
-                 VALUES ($1, $2, $3, 'admin', 'Legend', 50, 5000, 3500, 'Grandmaster', 10000, 'dragon')`,
-                ['admin', 'santasantol087@gmail.com', adminPasswordHash]
-            );
-            console.log('✅ Admin user created');
-        }
-        
-        console.log('✅ Database initialized');
-    } catch (error) {
-        console.error('Database init error:', error.message);
-    }
-}
-
-// Start server
-initDatabase().then(() => {
-    server.listen(PORT, '0.0.0.0', () => {
-        console.log('\n========================================');
-        console.log('🎮 RPS CYBER ARENA - NEON POSTGRESQL');
-        console.log('========================================');
-        console.log(`✅ Server running on port ${PORT}`);
-        console.log(`🌐 URL: https://rps-backend-6iq6.onrender.com`);
-        console.log('========================================');
-        console.log('📋 LOGIN CREDENTIALS:');
-        console.log('   👑 Admin: admin / Peaceking');
-        console.log('========================================\n');
-    });
+server.listen(PORT, '0.0.0.0', () => {
+    console.log('\n========================================');
+    console.log('🎮 RPS CYBER ARENA - NEON POSTGRESQL');
+    console.log('========================================');
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`🌐 Backend URL: https://rps-backend-6iq6.onrender.com`);
+    console.log('========================================');
+    console.log('📋 LOGIN CREDENTIALS:');
+    console.log('   👑 Admin: admin / Peaceking');
+    console.log('========================================\n');
 });
